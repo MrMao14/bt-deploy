@@ -1,0 +1,634 @@
+"""Tkinter 图形界面。标准库 GUI，PyInstaller 打包体积最小。"""
+
+from __future__ import annotations
+
+import copy
+import json
+import queue
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+from .api import BtApiError, BtClient
+from .deploy import (NEW_TARGET, RESTART_CHOICES, RESTART_LABELS, deploy,
+                     export_targets, load_config, merge_targets, save_config,
+                     target_sources)
+
+PAD = 6
+
+
+class TargetDialog(tk.Toplevel):
+    """新增/编辑单个部署目标。"""
+
+    def __init__(self, master, target: dict, data_loader=None):
+        super().__init__(master)
+        self.title('部署目标')
+        self.transient(master)
+        self.resizable(False, False)
+        self.result: dict | None = None
+        self.data = copy.deepcopy(target)
+        self.data_loader = data_loader
+        self._loading = False
+        self._payload: dict | None = None
+        self._java_paths: dict[str, str] = {}
+
+        self.body = ttk.Frame(self, padding=12)
+        self.body.grid(sticky='nsew')
+        self.body.columnconfigure(1, weight=1)
+
+        self.var_name = tk.StringVar(value=self.data.get('name', ''))
+        self.var_dst = tk.StringVar(value=self.data.get('remote_dir', ''))
+        self.var_tmp = tk.StringVar(value=self.data.get('temp_dir', '/tmp'))
+
+        restart = self.data.get('restart') or {}
+        self.var_kind = tk.StringVar(value=RESTART_LABELS.get(restart.get('type', 'none'), ''))
+        self.var_project = tk.StringVar(value=restart.get('project_name', ''))
+        self.var_service = tk.StringVar(value=restart.get('service_name', ''))
+
+        row = 0
+        self._row(row, '名称', ttk.Entry(self.body, textvariable=self.var_name, width=46))
+        row += 1
+
+        self._row(row, '本地路径', self._build_sources())
+        row += 1
+
+        # 可下拉可手输：面板上已配置的网站根目录会作为候选项
+        self.combo_dst = ttk.Combobox(self.body, textvariable=self.var_dst, width=46)
+        self._row(row, '远程目录', self.combo_dst)
+        row += 1
+        self._row(row, '临时目录', ttk.Entry(self.body, textvariable=self.var_tmp, width=46))
+        row += 1
+
+        kind_combo = ttk.Combobox(self.body, textvariable=self.var_kind, state='readonly',
+                                  values=[label for _, label in RESTART_CHOICES], width=43)
+        kind_combo.bind('<<ComboboxSelected>>', lambda _e: self._sync_restart_fields())
+        self._row(row, '部署后动作', kind_combo)
+        row += 1
+
+        # 可下拉可手输：拉得到面板上的项目就直接选，拉不到就自己填
+        self.combo_project = ttk.Combobox(self.body, textvariable=self.var_project, width=43)
+        self.combo_project.bind('<<ComboboxSelected>>', self._on_project_selected)
+        self.row_project = self._row(row, 'Java 项目名', self.combo_project)
+        row += 1
+        self.row_service = self._row(row, '服务名',
+                                     ttk.Entry(self.body, textvariable=self.var_service, width=46))
+        row += 1
+        self._sync_restart_fields()
+        self._load_panel_data()
+
+        ttk.Separator(self.body).grid(row=row, column=0, columnspan=2, sticky='ew', pady=10)
+        row += 1
+
+        buttons = ttk.Frame(self.body)
+        buttons.grid(row=row, column=0, columnspan=2, sticky='e')
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='left', padx=(0, PAD))
+        ttk.Button(buttons, text='保存', command=self._save).pack(side='left')
+
+        self.bind('<Return>', lambda _e: self._save())
+        self.bind('<Escape>', lambda _e: self.destroy())
+        # 必须等窗口真正 map 出来再 grab，否则 Tcl 会报 "grab failed: window not viewable"
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+
+    def _row(self, row: int, text: str, widget: tk.Widget):
+        """一行 = 标签 + 控件。两个都返回，隐藏整行时要一起处理。"""
+        label = ttk.Label(self.body, text=text, width=11, anchor='w')
+        label.grid(row=row, column=0, sticky='w', padx=(0, 8), pady=3)
+        widget.grid(row=row, column=1, sticky='ew', pady=3)
+        return label, widget
+
+    def _build_sources(self) -> ttk.Frame:
+        """本地路径能加多个：目录、单个文件、已有的 zip 都行。"""
+        box = ttk.Frame(self.body)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+
+        self.list_src = tk.Listbox(box, height=5, selectmode='extended', activestyle='none')
+        self.list_src.grid(row=0, column=0, sticky='nsew')
+        for item in target_sources(self.data):
+            self.list_src.insert('end', item)
+
+        scroll = ttk.Scrollbar(box, orient='vertical', command=self.list_src.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.list_src.configure(yscrollcommand=scroll.set)
+
+        buttons = ttk.Frame(box)
+        buttons.grid(row=0, column=2, sticky='n', padx=(6, 0))
+        ttk.Button(buttons, text='添加目录…', command=self._add_dir).pack(fill='x')
+        ttk.Button(buttons, text='添加文件…', command=self._add_files).pack(fill='x', pady=(4, 0))
+        ttk.Button(buttons, text='移除选中', command=self._remove_sources).pack(fill='x', pady=(4, 0))
+        return box
+
+    def _add_dir(self):
+        chosen = filedialog.askdirectory(title='选择要部署的目录')
+        if chosen:
+            self._append_sources([str(Path(chosen))])
+
+    def _add_files(self):
+        chosen = filedialog.askopenfilenames(title='选择要部署的文件（可多选）')
+        if chosen:
+            self._append_sources([str(Path(item)) for item in chosen])
+
+    def _append_sources(self, items):
+        existing = set(self.list_src.get(0, 'end'))
+        for item in items:
+            if item not in existing:
+                self.list_src.insert('end', item)
+                existing.add(item)
+
+    def _remove_sources(self):
+        for index in reversed(self.list_src.curselection()):
+            self.list_src.delete(index)
+
+    def _sync_restart_fields(self):
+        kind = self._kind()
+        for widget in self.row_project + self.row_service:
+            widget.grid_remove()
+        # grid_remove 会记住原位置，重新 grid 即可，顺序不会乱
+        if kind == 'java_restart':
+            target = self.row_project
+        elif kind == 'service_restart':
+            target = self.row_service
+        else:
+            target = ()
+        for widget in target:
+            widget.grid()
+
+    def _load_panel_data(self):
+        """后台拉一次面板数据（网站根目录 + Java 项目名）填进下拉。
+
+        工作线程只写结果，after 轮询一律由主线程发起 —— Tkinter 不是线程安全的。
+        """
+        if self._loading or self.data_loader is None:
+            return
+        self._loading = True
+        self._payload = None
+
+        def worker():
+            try:
+                self._payload = self.data_loader() or {}
+            except Exception:
+                self._payload = {}
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_panel_data()
+
+    def _poll_panel_data(self):
+        if not self.winfo_exists():
+            return
+        if self._payload is None:
+            self.after(100, self._poll_panel_data)
+            return
+
+        payload, self._payload = self._payload, None
+        self._loading = False
+
+        self.combo_dst.configure(values=list(payload.get('dirs') or []))
+
+        projects = [item for item in (payload.get('java_projects') or [])
+                    if isinstance(item, dict) and item.get('name')]
+        self._java_paths = {item['name']: item.get('path') or '' for item in projects}
+
+        names = [item['name'] for item in projects]
+        current = self.var_project.get().strip()
+        if current and current not in names:
+            names.insert(0, current)
+        self.combo_project.configure(values=names)
+
+        # 打开对话框时已经选好 Java 项目的话，顺手把目录也带出来
+        if not self.var_dst.get().strip():
+            self._on_project_selected()
+
+    def _on_project_selected(self, _event=None):
+        """选了 Java 项目就把它的目录填进远程目录，省得手打。"""
+        path = self._java_paths.get(self.var_project.get().strip(), '')
+        if path:
+            self.var_dst.set(path)
+
+    def _kind(self) -> str:
+        for value, label in RESTART_CHOICES:
+            if label == self.var_kind.get():
+                return value
+        return 'none'
+
+    def _save(self):
+        name = self.var_name.get().strip()
+        sources = list(self.list_src.get(0, 'end'))
+        dst = self.var_dst.get().strip()
+        if not name:
+            messagebox.showwarning('提示', '请填写名称', parent=self)
+            return
+        if not sources:
+            messagebox.showwarning('提示', '请至少添加一个本地路径', parent=self)
+            return
+        missing = [item for item in sources if not Path(item).expanduser().exists()]
+        if missing:
+            messagebox.showwarning('提示', '这些路径已经不存在了：\n' + '\n'.join(missing), parent=self)
+            return
+        if not dst:
+            messagebox.showwarning('提示', '请填写远程目标目录', parent=self)
+            return
+
+        kind = self._kind()
+        restart = {'type': kind}
+        if kind == 'java_restart':
+            project = self.var_project.get().strip()
+            if not project:
+                messagebox.showwarning('提示', '请填写 Java 项目名称', parent=self)
+                return
+            restart['project_name'] = project
+        elif kind == 'service_restart':
+            service = self.var_service.get().strip()
+            if not service:
+                messagebox.showwarning('提示', '请填写服务名，例如 nginx', parent=self)
+                return
+            restart['service_name'] = service
+
+        self.result = {
+            'name': name,
+            'source_dirs': sources,
+            'remote_dir': dst,
+            'temp_dir': self.var_tmp.get().strip() or '/tmp',
+            'restart': restart,
+        }
+        self.destroy()
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('宝塔部署助手')
+        self.geometry('920x680')
+        self.minsize(760, 520)
+
+        self.cfg = load_config()
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        self._busy = False
+        self._picked: set[int] = set()
+
+        self._build_panel()
+        self._build_targets()
+        self._build_log()
+        self._refresh_tree()
+
+        self.after(120, self._drain_log)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    # ------------------------------------------------------------- 界面搭建
+
+    def _build_panel(self):
+        box = ttk.LabelFrame(self, text=' 面板连接 ', padding=PAD)
+        box.pack(fill='x', padx=PAD * 2, pady=(PAD * 2, 0))
+        box.columnconfigure(1, weight=1)
+
+        self.var_url = tk.StringVar(value=self.cfg.get('panel_url', ''))
+        self.var_key = tk.StringVar(value=self.cfg.get('api_sk', ''))
+        self.var_ssl = tk.BooleanVar(value=bool(self.cfg.get('verify_ssl')))
+
+        ttk.Label(box, text='面板地址').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        ttk.Entry(box, textvariable=self.var_url).grid(row=0, column=1, sticky='ew')
+
+        ttk.Label(box, text='API 密钥').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=(4, 0))
+        key_row = ttk.Frame(box)
+        key_row.grid(row=1, column=1, sticky='ew', pady=(4, 0))
+        key_row.columnconfigure(0, weight=1)
+        self.entry_key = ttk.Entry(key_row, textvariable=self.var_key, show='*')
+        self.entry_key.grid(row=0, column=0, sticky='ew')
+        ttk.Checkbutton(key_row, text='显示', command=self._toggle_key).grid(row=0, column=1, padx=(6, 0))
+
+        opts = ttk.Frame(box)
+        opts.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+        ttk.Checkbutton(opts, text='校验 SSL 证书（面板用自签证书时不要勾选）',
+                        variable=self.var_ssl).pack(side='left')
+        ttk.Button(opts, text='测试连接', command=self._test_connection).pack(side='right')
+        ttk.Button(opts, text='诊断面板数据', command=self._diagnose).pack(side='right', padx=(0, PAD))
+
+    def _build_targets(self):
+        box = ttk.LabelFrame(self, text=' 部署目标 ', padding=PAD)
+        box.pack(fill='both', expand=True, padx=PAD * 2, pady=(PAD * 2, 0))
+
+        # 第一列是手写的勾选标记 —— Treeview 没有原生复选框
+        columns = ('pick', 'name', 'source', 'remote', 'restart')
+        self.tree = ttk.Treeview(box, columns=columns, show='headings', height=7)
+        for key, text, width in (('pick', '', 34), ('name', '名称', 150),
+                                 ('source', '本地目录', 240), ('remote', '远程目录', 210),
+                                 ('restart', '部署后动作', 130)):
+            self.tree.heading(key, text=text)
+            self.tree.column(key, width=width, stretch=key != 'pick',
+                             anchor='center' if key == 'pick' else 'w')
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        self.tree.bind('<Button-1>', self._on_tree_click)
+        self.tree.bind('<Double-1>', lambda _e: self._edit_target())
+
+        scroll = ttk.Scrollbar(box, orient='vertical', command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.tree.configure(yscrollcommand=scroll.set)
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+
+        actions = ttk.Frame(box)
+        actions.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
+        ttk.Button(actions, text='新增', command=self._add_target).pack(side='left')
+        ttk.Button(actions, text='编辑', command=self._edit_target).pack(side='left', padx=(PAD, 0))
+        ttk.Button(actions, text='删除', command=self._remove_target).pack(side='left', padx=(PAD, 0))
+        ttk.Button(actions, text='导入配置', command=self._import_config).pack(
+            side='left', padx=(PAD * 3, 0))
+        ttk.Button(actions, text='导出配置', command=self._export_config).pack(side='left', padx=(PAD, 0))
+        self.btn_deploy = ttk.Button(actions, text='开始部署', command=self._start_deploy)
+        self.btn_deploy.pack(side='right')
+
+    def _build_log(self):
+        box = ttk.LabelFrame(self, text=' 日志 ', padding=PAD)
+        box.pack(fill='both', expand=True, padx=PAD * 2, pady=PAD * 2)
+
+        self.txt = tk.Text(box, height=14, wrap='word', state='disabled',
+                           background='#1c1c1c', foreground='#dcdcdc', insertbackground='#dcdcdc')
+        self.txt.grid(row=0, column=0, sticky='nsew')
+        scroll = ttk.Scrollbar(box, orient='vertical', command=self.txt.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.txt.configure(yscrollcommand=scroll.set)
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+
+        ttk.Button(box, text='清空日志', command=self._clear_log).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
+
+    # ------------------------------------------------------------- 小工具
+
+    def _toggle_key(self):
+        self.entry_key.configure(show='' if self.entry_key.cget('show') else '*')
+
+    def _log(self, message: str):
+        self._log_queue.put(message)
+
+    def _drain_log(self):
+        while True:
+            try:
+                message = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.txt.configure(state='normal')
+            self.txt.insert('end', message + '\n')
+            self.txt.see('end')
+            self.txt.configure(state='disabled')
+        self.after(120, self._drain_log)
+
+    def _clear_log(self):
+        self.txt.configure(state='normal')
+        self.txt.delete('1.0', 'end')
+        self.txt.configure(state='disabled')
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        self.btn_deploy.configure(state='disabled' if busy else 'normal')
+
+    def _persist_panel(self):
+        self.cfg['panel_url'] = self.var_url.get().strip()
+        self.cfg['api_sk'] = self.var_key.get().strip()
+        self.cfg['verify_ssl'] = bool(self.var_ssl.get())
+        save_config(self.cfg)
+
+    def _client(self) -> BtClient:
+        """把界面上的面板连接信息写回配置，再构造客户端。"""
+        self._persist_panel()
+        return BtClient(self.cfg['panel_url'], self.cfg['api_sk'], self.cfg['verify_ssl'])
+
+    def _refresh_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        for index, target in enumerate(self.cfg['targets']):
+            restart = target.get('restart') or {}
+            label = RESTART_LABELS.get(restart.get('type', 'none'), restart.get('type', ''))
+            extra = restart.get('project_name') or restart.get('service_name')
+            sources = target_sources(target)
+            if len(sources) > 1:
+                shown = f'{sources[0]} 等 {len(sources)} 项'
+            else:
+                shown = sources[0] if sources else ''
+            mark = '☑' if index in self._picked else '☐'
+            self.tree.insert('', 'end', iid=str(index), values=(
+                mark, target.get('name', ''), shown,
+                target.get('remote_dir', ''), f'{label}{"：" + extra if extra else ""}'))
+
+    def _on_tree_click(self, event):
+        """点第一列切换勾选。只有点在这一列上才处理，其余交给默认行为。"""
+        if self.tree.identify('region', event.x, event.y) != 'cell':
+            return None
+        if self.tree.identify_column(event.x) != '#1':
+            return None
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return None
+        self._picked.symmetric_difference_update({int(iid)})
+        self._refresh_tree()
+        return 'break'
+
+    def _selected_index(self) -> int | None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo('提示', '请先选择一个部署目标')
+            return None
+        return int(selection[0])
+
+    # ------------------------------------------------------------- 目标管理
+
+    def _add_target(self):
+        dialog = TargetDialog(self, copy.deepcopy(NEW_TARGET), self._load_panel_data)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.cfg['targets'].append(dialog.result)
+            save_config(self.cfg)
+            self._refresh_tree()
+
+    def _edit_target(self):
+        index = self._selected_index()
+        if index is None:
+            return
+        dialog = TargetDialog(self, self.cfg['targets'][index], self._load_panel_data)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.cfg['targets'][index] = dialog.result
+            save_config(self.cfg)
+            self._refresh_tree()
+
+    def _remove_target(self):
+        index = self._selected_index()
+        if index is None:
+            return
+        name = self.cfg['targets'][index].get('name', '')
+        if not messagebox.askyesno('确认', f'删除部署目标「{name}」？'):
+            return
+        del self.cfg['targets'][index]
+        self._picked.clear()  # 索引会往前挪，勾选状态直接作废重来
+        save_config(self.cfg)
+        self._refresh_tree()
+
+    def _export_config(self):
+        """导出成 JSON 给别人用。故意不带 API 密钥。"""
+        if not self.cfg['targets']:
+            messagebox.showinfo('提示', '还没有可导出的部署目标')
+            return
+        path = filedialog.asksaveasfilename(
+            title='导出配置', defaultextension='.json',
+            initialfile='bt-deploy-targets.json',
+            filetypes=[('JSON 配置', '*.json'), ('所有文件', '*.*')],
+        )
+        if not path:
+            return
+
+        payload = export_targets(self.cfg['targets'], self.var_url.get().strip(),
+                                 bool(self.var_ssl.get()))
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                  encoding='utf-8')
+        except OSError as exc:
+            messagebox.showerror('导出失败', str(exc))
+            return
+        self._log(f'✅ 已导出 {len(self.cfg["targets"])} 个部署目标到 {path}（不含 API 密钥）')
+
+    def _import_config(self):
+        """导入别人分享的 JSON：同名覆盖，其余追加。"""
+        path = filedialog.askopenfilename(
+            title='导入配置', filetypes=[('JSON 配置', '*.json'), ('所有文件', '*.*')])
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror('导入失败', f'读不了这个文件：{exc}')
+            return
+
+        if isinstance(payload, list):
+            incoming, meta = payload, {}
+        elif isinstance(payload, dict):
+            incoming, meta = payload.get('targets'), payload
+        else:
+            incoming, meta = None, {}
+
+        if not isinstance(incoming, list):
+            messagebox.showerror('导入失败', '文件里没有 targets 数组')
+            return
+
+        self.cfg['targets'], added, replaced = merge_targets(self.cfg['targets'], incoming)
+        if meta.get('panel_url'):
+            self.var_url.set(str(meta['panel_url']))
+        if 'verify_ssl' in meta:
+            self.var_ssl.set(bool(meta['verify_ssl']))
+
+        self._picked.clear()
+        save_config(self.cfg)
+        self._refresh_tree()
+        self._log(f'✅ 已导入：新增 {added} 个，覆盖 {replaced} 个。API 密钥需要自己填。')
+
+    # ------------------------------------------------------------- 任务执行
+
+    def _run_async(self, title: str, work):
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._log(f'—— {title} ——')
+
+        def runner():
+            try:
+                work()
+            except BtApiError as exc:
+                self._log(f'❌ {exc}')
+            except Exception as exc:  # 兜底，别让线程静默死掉
+                self._log(f'❌ 未预期的错误：{type(exc).__name__}: {exc}')
+            finally:
+                self.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _test_connection(self):
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+
+        def work():
+            client.test_connection()
+            self._log('✅ 连接成功，密钥与 IP 白名单均正常')
+
+        self._run_async('测试连接', work)
+
+    def _diagnose(self):
+        """把列表接口的原始响应打到日志区 —— 面板字段名只能靠这个确认。"""
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+
+        def work():
+            snapshot = client.raw_panel_snapshot()
+            for label, payload in snapshot.items():
+                self._log(f'—— {label} ——')
+                self._log(json.dumps(payload, ensure_ascii=False, indent=2)[:4000])
+
+        self._run_async('诊断面板数据', work)
+
+    def _load_panel_data(self) -> dict:
+        """给编辑对话框拉候选：网站根目录、Java 项目名。拉不到就给空的，用户手输。"""
+        try:
+            client = self._client()
+        except BtApiError:
+            return {'dirs': [], 'java_projects': []}
+
+        dirs: list[str] = []
+        projects: list[dict] = []
+        try:
+            dirs = [item['path'] for item in client.list_sites()]
+        except BtApiError:
+            pass
+        try:
+            projects = client.list_java_projects()
+        except BtApiError:
+            pass
+        return {'dirs': dirs, 'java_projects': projects}
+
+    def _start_deploy(self):
+        # 勾了多个就按顺序批量跑；一个都没勾就用当前高亮的那一个
+        picked = sorted(index for index in self._picked
+                        if 0 <= index < len(self.cfg['targets']))
+        if picked:
+            batch = [(index, self.cfg['targets'][index]) for index in picked]
+        else:
+            index = self._selected_index()
+            if index is None:
+                return
+            batch = [(index, self.cfg['targets'][index])]
+
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+
+        if len(batch) == 1:
+            target = batch[0][1]
+            self._run_async(f'部署「{target.get("name", "")}」',
+                            lambda: deploy(client, target, log=self._log))
+            return
+
+        def work():
+            total = len(batch)
+            for order, (_index, target) in enumerate(batch, 1):
+                self._log(f'===== ({order}/{total}) {target.get("name", "")} =====')
+                deploy(client, target, log=self._log)
+                self._log('')
+            self._log(f'全部完成，共 {total} 个部署目标')
+
+        self._run_async(f'按顺序部署 {len(batch)} 个目标', work)
+
+    # ------------------------------------------------------------- 退出
+
+    def _on_close(self):
+        if self._busy and not messagebox.askyesno('确认', '正在部署中，确定要退出吗？'):
+            return
+        self._persist_panel()
+        self.destroy()
+
+
+def run():
+    App().mainloop()

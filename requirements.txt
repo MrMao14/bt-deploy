@@ -1,0 +1,3 @@
+# 程序本身零第三方依赖：HTTP 用 urllib、打包用 zipfile、界面用 tkinter，全是标准库。
+# 下面这个只有执行 build.py 打包时才需要。
+pyinstaller>=6.0
