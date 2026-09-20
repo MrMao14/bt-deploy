@@ -8,12 +8,12 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .api import BtApiError, BtClient
 from .deploy import (NEW_TARGET, RESTART_CHOICES, RESTART_LABELS, deploy,
-                     export_targets, load_config, merge_targets, save_config,
-                     target_sources)
+                     export_targets, load_config, merge_targets, new_panel,
+                     save_config, target_sources)
 
 PAD = 6
 
@@ -52,6 +52,11 @@ class TargetDialog(tk.Toplevel):
 
         self._row(row, '本地路径', self._build_sources())
         row += 1
+        self.var_keep_root = tk.BooleanVar(value=bool(self.data.get('keep_root', True)))
+        self._row(row, '', ttk.Checkbutton(
+            self.body, variable=self.var_keep_root,
+            text='保留目录名（选 lib 传到 …/admin/lib；不勾则铺到 …/admin）'))
+        row += 1
 
         # 可下拉可手输：面板上已配置的网站根目录会作为候选项
         self.combo_dst = ttk.Combobox(self.body, textvariable=self.var_dst, width=46)
@@ -87,10 +92,22 @@ class TargetDialog(tk.Toplevel):
 
         self.bind('<Return>', lambda _e: self._save())
         self.bind('<Escape>', lambda _e: self.destroy())
+        self.resize_to_content(master)
         # 必须等窗口真正 map 出来再 grab，否则 Tcl 会报 "grab failed: window not viewable"
         self.wait_visibility()
         self.grab_set()
         self.focus_set()
+
+    def resize_to_content(self, master):
+        """按内容定尺寸并居中到父窗口 —— Tk 默认会把 Toplevel 丢到屏幕左上角。"""
+        self.update_idletasks()
+        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = master.winfo_rootx() + (master.winfo_width() - width) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - height) // 2
+        # 别跑到屏幕外面去
+        x = max(0, min(x, self.winfo_screenwidth() - width))
+        y = max(0, min(y, self.winfo_screenheight() - height))
+        self.geometry(f'{width}x{height}+{x}+{y}')
 
     def _row(self, row: int, text: str, widget: tk.Widget):
         """一行 = 标签 + 控件。两个都返回，隐藏整行时要一起处理。"""
@@ -107,12 +124,21 @@ class TargetDialog(tk.Toplevel):
 
         self.list_src = tk.Listbox(box, height=5, selectmode='extended', activestyle='none')
         self.list_src.grid(row=0, column=0, sticky='nsew')
+
+        vscroll = ttk.Scrollbar(box, orient='vertical', command=self.list_src.yview)
+        vscroll.grid(row=0, column=1, sticky='ns')
+        hscroll = ttk.Scrollbar(box, orient='horizontal', command=self.list_src.xview)
+        hscroll.grid(row=1, column=0, sticky='ew')
+        self.list_src.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+        self.list_src.bind('<<ListboxSelect>>', self._show_full_path)
+
         for item in target_sources(self.data):
             self.list_src.insert('end', item)
 
-        scroll = ttk.Scrollbar(box, orient='vertical', command=self.list_src.yview)
-        scroll.grid(row=0, column=1, sticky='ns')
-        self.list_src.configure(yscrollcommand=scroll.set)
+        # 路径长的时候横向也看不全，选中哪条就在下面把完整路径折行显示出来
+        self.lbl_full = ttk.Label(box, text='', wraplength=430, justify='left',
+                                  foreground='#555')
+        self.lbl_full.grid(row=2, column=0, columnspan=2, sticky='w', pady=(3, 0))
 
         buttons = ttk.Frame(box)
         buttons.grid(row=0, column=2, sticky='n', padx=(6, 0))
@@ -141,6 +167,11 @@ class TargetDialog(tk.Toplevel):
     def _remove_sources(self):
         for index in reversed(self.list_src.curselection()):
             self.list_src.delete(index)
+        self._show_full_path()
+
+    def _show_full_path(self, _event=None):
+        picked = self.list_src.curselection()
+        self.lbl_full.configure(text=self.list_src.get(picked[0]) if picked else '')
 
     def _sync_restart_fields(self):
         kind = self._kind()
@@ -249,6 +280,7 @@ class TargetDialog(tk.Toplevel):
         self.result = {
             'name': name,
             'source_dirs': sources,
+            'keep_root': bool(self.var_keep_root.get()),
             'remote_dir': dst,
             'temp_dir': self.var_tmp.get().strip() or '/tmp',
             'restart': restart,
@@ -270,7 +302,7 @@ class App(tk.Tk):
         self._build_panel()
         self._build_targets()
         self._build_log()
-        self._refresh_tree()
+        self._load_active_panel()
 
         self.after(120, self._drain_log)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -282,23 +314,36 @@ class App(tk.Tk):
         box.pack(fill='x', padx=PAD * 2, pady=(PAD * 2, 0))
         box.columnconfigure(1, weight=1)
 
-        self.var_url = tk.StringVar(value=self.cfg.get('panel_url', ''))
-        self.var_key = tk.StringVar(value=self.cfg.get('api_sk', ''))
-        self.var_ssl = tk.BooleanVar(value=bool(self.cfg.get('verify_ssl')))
+        self.var_panel = tk.StringVar()
+        self.var_url = tk.StringVar()
+        self.var_key = tk.StringVar()
+        self.var_ssl = tk.BooleanVar()
 
-        ttk.Label(box, text='面板地址').grid(row=0, column=0, sticky='w', padx=(0, 8))
-        ttk.Entry(box, textvariable=self.var_url).grid(row=0, column=1, sticky='ew')
+        ttk.Label(box, text='面板').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        pick = ttk.Frame(box)
+        pick.grid(row=0, column=1, sticky='ew')
+        pick.columnconfigure(0, weight=1)
+        self.combo_panel = ttk.Combobox(pick, textvariable=self.var_panel,
+                                        state='readonly')
+        self.combo_panel.grid(row=0, column=0, sticky='ew')
+        self.combo_panel.bind('<<ComboboxSelected>>', self._on_panel_switch)
+        ttk.Button(pick, text='新增', command=self._add_panel).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(pick, text='重命名', command=self._rename_panel).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(pick, text='删除', command=self._remove_panel).grid(row=0, column=3, padx=(4, 0))
 
-        ttk.Label(box, text='API 密钥').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=(4, 0))
+        ttk.Label(box, text='面板地址').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=(4, 0))
+        ttk.Entry(box, textvariable=self.var_url).grid(row=1, column=1, sticky='ew', pady=(4, 0))
+
+        ttk.Label(box, text='API 密钥').grid(row=2, column=0, sticky='w', padx=(0, 8), pady=(4, 0))
         key_row = ttk.Frame(box)
-        key_row.grid(row=1, column=1, sticky='ew', pady=(4, 0))
+        key_row.grid(row=2, column=1, sticky='ew', pady=(4, 0))
         key_row.columnconfigure(0, weight=1)
         self.entry_key = ttk.Entry(key_row, textvariable=self.var_key, show='*')
         self.entry_key.grid(row=0, column=0, sticky='ew')
         ttk.Checkbutton(key_row, text='显示', command=self._toggle_key).grid(row=0, column=1, padx=(6, 0))
 
         opts = ttk.Frame(box)
-        opts.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+        opts.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(6, 0))
         ttk.Checkbutton(opts, text='校验 SSL 证书（面板用自签证书时不要勾选）',
                         variable=self.var_ssl).pack(side='left')
         ttk.Button(opts, text='测试连接', command=self._test_connection).pack(side='right')
@@ -332,9 +377,12 @@ class App(tk.Tk):
         ttk.Button(actions, text='新增', command=self._add_target).pack(side='left')
         ttk.Button(actions, text='编辑', command=self._edit_target).pack(side='left', padx=(PAD, 0))
         ttk.Button(actions, text='删除', command=self._remove_target).pack(side='left', padx=(PAD, 0))
+        ttk.Button(actions, text='↑ 上移', command=lambda: self._move_target(-1)).pack(
+            side='left', padx=(PAD * 3, 0))
+        ttk.Button(actions, text='↓ 下移', command=lambda: self._move_target(1)).pack(
+            side='left', padx=(PAD, 0))
         ttk.Button(actions, text='导入配置', command=self._import_config).pack(
             side='left', padx=(PAD * 3, 0))
-        ttk.Button(actions, text='导出配置', command=self._export_config).pack(side='left', padx=(PAD, 0))
         self.btn_deploy = ttk.Button(actions, text='开始部署', command=self._start_deploy)
         self.btn_deploy.pack(side='right')
 
@@ -382,20 +430,102 @@ class App(tk.Tk):
         self._busy = busy
         self.btn_deploy.configure(state='disabled' if busy else 'normal')
 
+    def panel(self) -> dict:
+        """当前面板。索引越界就夹回 0，保证永远有一个能用的。"""
+        panels = self.cfg['panels']
+        index = self.cfg.get('active_panel', 0)
+        if not isinstance(index, int) or not 0 <= index < len(panels):
+            index = 0
+            self.cfg['active_panel'] = 0
+        return panels[index]
+
+    def _targets(self) -> list:
+        """当前面板的部署目标列表。"""
+        return self.panel().setdefault('targets', [])
+
     def _persist_panel(self):
-        self.cfg['panel_url'] = self.var_url.get().strip()
-        self.cfg['api_sk'] = self.var_key.get().strip()
-        self.cfg['verify_ssl'] = bool(self.var_ssl.get())
+        """把界面上的连接信息写回**当前**面板，别的面板不动。"""
+        panel = self.panel()
+        panel['panel_url'] = self.var_url.get().strip()
+        panel['api_sk'] = self.var_key.get().strip()
+        panel['verify_ssl'] = bool(self.var_ssl.get())
         save_config(self.cfg)
 
     def _client(self) -> BtClient:
-        """把界面上的面板连接信息写回配置，再构造客户端。"""
+        """把界面上的连接信息写回配置，再按当前面板构造客户端。"""
         self._persist_panel()
-        return BtClient(self.cfg['panel_url'], self.cfg['api_sk'], self.cfg['verify_ssl'])
+        panel = self.panel()
+        return BtClient(panel['panel_url'], panel['api_sk'], panel['verify_ssl'])
+
+    def _refresh_panel_choices(self):
+        names = [item.get('name', '') for item in self.cfg['panels']]
+        self.combo_panel.configure(values=names)
+        self.var_panel.set(names[self.cfg['active_panel']])
+
+    def _load_active_panel(self):
+        """把当前面板的连接信息填进输入框，并刷新目标列表。"""
+        panel = self.panel()
+        self.var_url.set(panel.get('panel_url', ''))
+        self.var_key.set(panel.get('api_sk', ''))
+        self.var_ssl.set(bool(panel.get('verify_ssl')))
+        self._picked.clear()
+        self._refresh_panel_choices()
+        self._refresh_tree()
+
+    def _on_panel_switch(self, _event=None):
+        self._persist_panel()   # 先存下刚编辑的内容，再切走
+        name = self.var_panel.get()
+        for index, item in enumerate(self.cfg['panels']):
+            if item.get('name') == name:
+                self.cfg['active_panel'] = index
+                break
+        save_config(self.cfg)
+        self._load_active_panel()
+
+    def _add_panel(self):
+        name = (simpledialog.askstring('新增面板', '给这个面板起个名字：', parent=self) or '').strip()
+        if not name:
+            return
+        if any(item.get('name') == name for item in self.cfg['panels']):
+            messagebox.showwarning('提示', f'已经有一个叫「{name}」的面板了')
+            return
+        self._persist_panel()
+        self.cfg['panels'].append(new_panel(name))
+        self.cfg['active_panel'] = len(self.cfg['panels']) - 1
+        save_config(self.cfg)
+        self._load_active_panel()
+        self._log(f'已新增面板「{name}」，填好地址和密钥后点「测试连接」')
+
+    def _rename_panel(self):
+        panel = self.panel()
+        name = (simpledialog.askstring('重命名面板', '新的名称：', parent=self,
+                                       initialvalue=panel.get('name', '')) or '').strip()
+        if not name or name == panel.get('name'):
+            return
+        if any(item is not panel and item.get('name') == name for item in self.cfg['panels']):
+            messagebox.showwarning('提示', f'已经有一个叫「{name}」的面板了')
+            return
+        panel['name'] = name
+        save_config(self.cfg)
+        self._load_active_panel()
+
+    def _remove_panel(self):
+        if len(self.cfg['panels']) <= 1:
+            messagebox.showinfo('提示', '至少要保留一个面板')
+            return
+        panel = self.panel()
+        count = len(panel.get('targets') or [])
+        if not messagebox.askyesno(
+                '确认', f'删除面板「{panel.get("name", "")}」及其 {count} 个部署目标？'):
+            return
+        del self.cfg['panels'][self.cfg['active_panel']]
+        self.cfg['active_panel'] = max(0, self.cfg['active_panel'] - 1)
+        save_config(self.cfg)
+        self._load_active_panel()
 
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
-        for index, target in enumerate(self.cfg['targets']):
+        for index, target in enumerate(self._targets()):
             restart = target.get('restart') or {}
             label = RESTART_LABELS.get(restart.get('type', 'none'), restart.get('type', ''))
             extra = restart.get('project_name') or restart.get('service_name')
@@ -435,7 +565,7 @@ class App(tk.Tk):
         dialog = TargetDialog(self, copy.deepcopy(NEW_TARGET), self._load_panel_data)
         self.wait_window(dialog)
         if dialog.result:
-            self.cfg['targets'].append(dialog.result)
+            self._targets().append(dialog.result)
             save_config(self.cfg)
             self._refresh_tree()
 
@@ -443,10 +573,10 @@ class App(tk.Tk):
         index = self._selected_index()
         if index is None:
             return
-        dialog = TargetDialog(self, self.cfg['targets'][index], self._load_panel_data)
+        dialog = TargetDialog(self, self._targets()[index], self._load_panel_data)
         self.wait_window(dialog)
         if dialog.result:
-            self.cfg['targets'][index] = dialog.result
+            self._targets()[index] = dialog.result
             save_config(self.cfg)
             self._refresh_tree()
 
@@ -454,17 +584,42 @@ class App(tk.Tk):
         index = self._selected_index()
         if index is None:
             return
-        name = self.cfg['targets'][index].get('name', '')
+        name = self._targets()[index].get('name', '')
         if not messagebox.askyesno('确认', f'删除部署目标「{name}」？'):
             return
-        del self.cfg['targets'][index]
+        del self._targets()[index]
         self._picked.clear()  # 索引会往前挪，勾选状态直接作废重来
         save_config(self.cfg)
         self._refresh_tree()
 
+    def _move_target(self, delta: int):
+        """上下移动部署目标。批量部署按列表顺序跑，所以顺序是有意义的。"""
+        index = self._selected_index()
+        if index is None:
+            return
+        targets = self._targets()
+        new_index = index + delta
+        if not 0 <= new_index < len(targets):
+            return
+
+        targets[index], targets[new_index] = targets[new_index], targets[index]
+
+        # 勾选状态是按下标存的，位置换了要跟着换，否则勾的会变成另一条
+        was_a, was_b = index in self._picked, new_index in self._picked
+        self._picked.discard(index)
+        self._picked.discard(new_index)
+        if was_a:
+            self._picked.add(new_index)
+        if was_b:
+            self._picked.add(index)
+
+        save_config(self.cfg)
+        self._refresh_tree()
+        self.tree.selection_set(str(new_index))
+        self.tree.focus(str(new_index))
     def _export_config(self):
         """导出成 JSON 给别人用。故意不带 API 密钥。"""
-        if not self.cfg['targets']:
+        if not self._targets():
             messagebox.showinfo('提示', '还没有可导出的部署目标')
             return
         path = filedialog.asksaveasfilename(
@@ -475,7 +630,7 @@ class App(tk.Tk):
         if not path:
             return
 
-        payload = export_targets(self.cfg['targets'], self.var_url.get().strip(),
+        payload = export_targets(self._targets(), self.var_url.get().strip(),
                                  bool(self.var_ssl.get()))
         try:
             Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2),
@@ -483,7 +638,8 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror('导出失败', str(exc))
             return
-        self._log(f'✅ 已导出 {len(self.cfg["targets"])} 个部署目标到 {path}（不含 API 密钥）')
+        self._log(f'✅ 已导出面板「{self.panel().get("name", "")}」的 '
+                  f'{len(self._targets())} 个部署目标到 {path}（不含 API 密钥）')
 
     def _import_config(self):
         """导入别人分享的 JSON：同名覆盖，其余追加。"""
@@ -508,7 +664,8 @@ class App(tk.Tk):
             messagebox.showerror('导入失败', '文件里没有 targets 数组')
             return
 
-        self.cfg['targets'], added, replaced = merge_targets(self.cfg['targets'], incoming)
+        merged, added, replaced = merge_targets(self._targets(), incoming)
+        self.panel()['targets'] = merged
         if meta.get('panel_url'):
             self.var_url.set(str(meta['panel_url']))
         if 'verify_ssl' in meta:
@@ -589,15 +746,15 @@ class App(tk.Tk):
 
     def _start_deploy(self):
         # 勾了多个就按顺序批量跑；一个都没勾就用当前高亮的那一个
-        picked = sorted(index for index in self._picked
-                        if 0 <= index < len(self.cfg['targets']))
+        targets = self._targets()
+        picked = sorted(index for index in self._picked if 0 <= index < len(targets))
         if picked:
-            batch = [(index, self.cfg['targets'][index]) for index in picked]
+            batch = [(index, targets[index]) for index in picked]
         else:
             index = self._selected_index()
             if index is None:
                 return
-            batch = [(index, self.cfg['targets'][index])]
+            batch = [(index, targets[index])]
 
         try:
             client = self._client()

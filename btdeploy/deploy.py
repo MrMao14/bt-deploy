@@ -25,11 +25,12 @@ RESTART_CHOICES = [
 ]
 RESTART_LABELS = dict(RESTART_CHOICES)
 
+DEFAULT_PANEL_NAME = '默认面板'
+
 DEFAULT_CONFIG = {
-    'panel_url': '',
-    'api_sk': '',
-    'verify_ssl': False,
-    'targets': [],
+    'version': 2,
+    'active_panel': 0,
+    'panels': [],
 }
 
 NEW_TARGET = {
@@ -37,24 +38,74 @@ NEW_TARGET = {
     'source_dirs': [],
     'remote_dir': '',
     'temp_dir': DEFAULT_TEMP_DIR,
+    'keep_root': True,
     'restart': {'type': 'none'},
 }
 
 
+def new_panel(name: str = DEFAULT_PANEL_NAME) -> dict:
+    """一个面板 = 一套连接信息 + 自己的部署目标。各面板互不干扰。"""
+    return {
+        'name': name,
+        'panel_url': '',
+        'api_sk': '',
+        'verify_ssl': False,
+        'targets': [],
+    }
+
+
 # ---------------------------------------------------------------------- 配置
+
+def _migrate_config(data) -> dict:
+    """把配置规整成多面板结构，顺手把老版本的单面板配置升上来。"""
+    if not isinstance(data, dict):
+        data = {}
+
+    raw_panels = data.get('panels')
+    if not isinstance(raw_panels, list) or not raw_panels:
+        if data.get('panel_url') or data.get('targets'):
+            # v1：整个文件就是一个面板
+            raw_panels = [{
+                'name': DEFAULT_PANEL_NAME,
+                'panel_url': data.get('panel_url', ''),
+                'api_sk': data.get('api_sk', ''),
+                'verify_ssl': bool(data.get('verify_ssl')),
+                'targets': data.get('targets') or [],
+            }]
+        else:
+            raw_panels = [new_panel()]
+
+    panels = []
+    for item in raw_panels:
+        if not isinstance(item, dict):
+            continue
+        panel = new_panel(str(item.get('name') or f'面板 {len(panels) + 1}'))
+        panel['panel_url'] = str(item.get('panel_url') or '')
+        panel['api_sk'] = str(item.get('api_sk') or '')
+        panel['verify_ssl'] = bool(item.get('verify_ssl'))
+        targets = item.get('targets')
+        if isinstance(targets, list):
+            panel['targets'] = [item for item in targets if isinstance(item, dict)]
+        panels.append(panel)
+
+    if not panels:
+        panels = [new_panel()]
+
+    active = data.get('active_panel')
+    if not isinstance(active, int) or not 0 <= active < len(panels):
+        active = 0
+
+    return {'version': 2, 'active_panel': active, 'panels': panels}
+
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        return _migrate_config({})
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
-    if not isinstance(cfg['targets'], list):
-        cfg['targets'] = []
-    return cfg
+        return _migrate_config({})
+    return _migrate_config(data)
 
 
 def save_config(cfg: dict) -> None:
@@ -115,9 +166,15 @@ def target_sources(target: dict) -> list[str]:
     return [legacy] if legacy else []
 
 
-def _add_source(out: zipfile.ZipFile, source: Path, seen: set[str]) -> None:
-    """把一个目录/文件/zip 的内容并进目标 zip，同名条目先出现的优先。"""
+def _add_source(out: zipfile.ZipFile, source: Path, seen: set[str],
+               keep_root: bool = True) -> None:
+    """把一个目录/文件/zip 并进目标 zip，同名条目先出现的优先。
+
+    keep_root=True 时目录带上自己的名字：选 .../target/lib 会打成 lib/xxx，
+    解压到 /www/wwwroot/xst/admin 后就是 /www/wwwroot/xst/admin/lib/xxx。
+    """
     if source.is_dir():
+        prefix = f'{source.name}/' if keep_root else ''
         for root, _dirs, files in os.walk(source):
             for name in files:
                 full = Path(root) / name
@@ -127,7 +184,7 @@ def _add_source(out: zipfile.ZipFile, source: Path, seen: set[str]) -> None:
                         continue
                     # 必须用 POSIX 分隔符：Windows 下 relative_to 给出反斜杠，
                     # Linux 侧 unzip 会把 'a\\b.js' 整个当成文件名
-                    arc = full.relative_to(source).as_posix()
+                    arc = prefix + full.relative_to(source).as_posix()
                     if arc in seen:
                         continue
                     seen.add(arc)
@@ -148,7 +205,7 @@ def _add_source(out: zipfile.ZipFile, source: Path, seen: set[str]) -> None:
             out.write(source, source.name)
 
 
-def build_zip(sources: list[Path], work_dir: Path) -> Path:
+def build_zip(sources: list[Path], work_dir: Path, keep_root: bool = True) -> Path:
     """把多个目录/文件/zip 合并成一个 zip。"""
     sources = [item.resolve() for item in sources]
 
@@ -160,7 +217,7 @@ def build_zip(sources: list[Path], work_dir: Path) -> Path:
     seen: set[str] = set()
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as out:
         for source in sources:
-            _add_source(out, source, seen)
+            _add_source(out, source, seen, keep_root)
     return zip_path
 
 
@@ -210,7 +267,7 @@ def deploy(client: BtClient, target: dict, log=print) -> None:
         log(f'[1/5] 打包 {len(sources)} 个路径')
         for item in sources:
             log(f'      · {item}')
-        zip_path = build_zip(sources, Path(work))
+        zip_path = build_zip(sources, Path(work), target.get('keep_root', True))
         size_mb = zip_path.stat().st_size / 1024 / 1024
         log(f'      → {zip_path.name}（{size_mb:.2f} MB）')
 

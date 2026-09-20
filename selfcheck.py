@@ -16,8 +16,9 @@ import zipfile
 from pathlib import Path
 
 from btdeploy.api import BtApiError, BtClient
-from btdeploy.deploy import (RESTART_LABELS, build_zip, export_targets,
-                             merge_targets, restart_service, target_sources)
+from btdeploy.deploy import (RESTART_LABELS, _migrate_config, build_zip,
+                             export_targets, merge_targets, new_panel,
+                             restart_service, target_sources)
 
 # Windows 控制台默认用 GBK，直接打印 emoji 会 UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
@@ -98,30 +99,54 @@ def check_zip():
         (web / 'assets').mkdir(parents=True)
         (web / 'index.html').write_bytes(b'<h1>hi</h1>')
         (web / 'assets' / 'app.js').write_bytes(b'console.log(1)')
-        (web / 'assets' / 'shared.txt').write_bytes(b'from-dist')
 
-        conf = root / 'conf'
-        conf.mkdir()
-        (conf / 'app.yml').write_bytes(b'port: 8080')
-        (conf / 'assets').mkdir()
-        # 与 dist 同名的文件：先出现的来源应该赢
-        (conf / 'assets' / 'shared.txt').write_bytes(b'from-conf')
+        lib = root / 'lib'
+        (lib / 'nested').mkdir(parents=True)
+        (lib / 'a.jar').write_bytes(b'jar-a')
+        (lib / 'nested' / 'b.jar').write_bytes(b'jar-b')
 
         loose = root / 'robots.txt'
         loose.write_bytes(b'User-agent: *')
 
+        # 默认保留目录名：选 .../lib 就打进 lib/...，解压后是 目标目录/lib/...
         with tempfile.TemporaryDirectory() as work:
-            zip_path = build_zip([web, conf, loose], Path(work))
+            zip_path = build_zip([lib, loose], Path(work))
             with zipfile.ZipFile(zip_path) as zf:
                 names = sorted(zf.namelist())
-                assert names == ['app.yml', 'assets/app.js', 'assets/shared.txt',
-                                 'index.html', 'robots.txt'], names
+                assert names == ['lib/a.jar', 'lib/nested/b.jar', 'robots.txt'], names
                 # 必须是正斜杠：Windows 打包、Linux 解压时反斜杠会变成文件名的一部分
                 assert not any('\\' in name for name in names), names
-                assert zf.read('index.html') == b'<h1>hi</h1>'
-                assert zf.read('assets/shared.txt') == b'from-dist', '同名条目应先出现的优先'
+                assert zf.read('lib/nested/b.jar') == b'jar-b'
 
-            # 只给一个 zip 时原样直传，不再套一层
+        # 关掉 keep_root 就只把目录里的内容铺到目标目录
+        with tempfile.TemporaryDirectory() as work:
+            zip_path = build_zip([lib, loose], Path(work), keep_root=False)
+            with zipfile.ZipFile(zip_path) as zf:
+                names = sorted(zf.namelist())
+                assert names == ['a.jar', 'nested/b.jar', 'robots.txt'], names
+
+        # 多个来源各有各的顶层目录，同名文件天然不会撞
+        with tempfile.TemporaryDirectory() as work:
+            both = build_zip([web, lib], Path(work))
+            with zipfile.ZipFile(both) as zf:
+                names = sorted(zf.namelist())
+                assert names == ['dist/assets/app.js', 'dist/index.html',
+                                 'lib/a.jar', 'lib/nested/b.jar'], names
+
+        # 展开模式下同名条目以先出现的来源为准
+        conf = root / 'conf'
+        (conf / 'assets').mkdir(parents=True)
+        (conf / 'assets' / 'app.js').write_bytes(b'from-conf')
+        (conf / 'index.html').write_bytes(b'<h1>conf</h1>')
+        with tempfile.TemporaryDirectory() as work:
+            flat = build_zip([web, conf], Path(work), keep_root=False)
+            with zipfile.ZipFile(flat) as zf:
+                assert zf.read('assets/app.js') == b'console.log(1)', '先出现的来源应该赢'
+                assert zf.read('index.html') == b'<h1>hi</h1>'
+
+        # 单个 zip 原样直传，不再套一层
+        with tempfile.TemporaryDirectory() as work:
+            zip_path = build_zip([lib], Path(work))
             with tempfile.TemporaryDirectory() as work2:
                 assert build_zip([zip_path], Path(work2)) == zip_path.resolve()
 
@@ -129,9 +154,10 @@ def check_zip():
             with tempfile.TemporaryDirectory() as work3:
                 merged = build_zip([web, zip_path], Path(work3))
                 with zipfile.ZipFile(merged) as zf:
-                    assert 'app.yml' in zf.namelist(), 'zip 来源的内容没被合并'
-                    assert 'index.html' in zf.namelist()
-    print('✅ zip 打包：多路径合并、POSIX 路径、同名优先级、zip 直传')
+                    names = sorted(zf.namelist())
+                    assert 'dist/index.html' in names, names
+                    assert 'lib/a.jar' in names, 'zip 来源的内容没被合并'
+    print('✅ zip 打包：保留目录名 / 展开两种模式、POSIX 路径、zip 直传')
 
 
 def check_target_sources():
@@ -159,6 +185,44 @@ def check_java_path_pick():
     assert _pick_java_path({}) == ''
     assert _pick_java_path({'project_cmd': 'java -jar app.jar'}) == ''
     print('✅ Java 项目目录字段解析')
+
+def check_multi_panel():
+    """多面板结构 + v1 单面板配置的自动迁移。"""
+    # 老版本：整个文件就是一个面板
+    migrated = _migrate_config({
+        'panel_url': 'https://old:8888', 'api_sk': 'k', 'verify_ssl': True,
+        'targets': [{'name': 'a'}],
+    })
+    assert migrated['active_panel'] == 0, migrated
+    assert len(migrated['panels']) == 1, migrated
+    panel = migrated['panels'][0]
+    assert panel['panel_url'] == 'https://old:8888', panel
+    assert panel['api_sk'] == 'k', panel
+    assert panel['verify_ssl'] is True, panel
+    assert panel['targets'] == [{'name': 'a'}], panel
+
+    # 已经是新版就原样保留
+    v2 = _migrate_config({
+        'version': 2, 'active_panel': 1,
+        'panels': [{'name': 'p1'}, {'name': 'p2', 'targets': [{'name': 't'}]}],
+    })
+    assert [item['name'] for item in v2['panels']] == ['p1', 'p2'], v2
+    assert v2['active_panel'] == 1, v2
+    assert v2['panels'][1]['targets'] == [{'name': 't'}], v2
+
+    # 空配置和垃圾配置也得保证有一个能用的面板
+    for bad in ({}, None, 'junk', {'panels': []}, {'panels': 'junk'}):
+        cfg = _migrate_config(bad)
+        assert len(cfg['panels']) == 1, (bad, cfg)
+        assert cfg['active_panel'] == 0, (bad, cfg)
+
+    # active_panel 越界要夹回 0
+    assert _migrate_config(
+        {'panels': [{'name': 'a'}], 'active_panel': 9})['active_panel'] == 0
+
+    assert new_panel('x')['name'] == 'x'
+    print('✅ 多面板结构 / v1 单面板配置迁移')
+
 
 def check_config_io():
     """导出的 JSON 不能带 API 密钥；导入按名称合并。"""
@@ -306,10 +370,13 @@ def check_gui_constructs():
             assert dialog.row_service[1].winfo_manager() == '', '切换动作后该行应隐藏'
 
             # _save 会销毁对话框，顺便拿到 result 做列表渲染检查
+            assert dialog.var_keep_root.get() is True, '默认应该保留目录名'
+            dialog.var_keep_root.set(False)
             dialog._save()
             assert dialog.result is not None, '保存没产生结果'
+            assert dialog.result['keep_root'] is False, dialog.result
 
-            app.cfg['targets'] = [dialog.result, dict(dialog.result, name='第二个')]
+            app.panel()['targets'] = [dialog.result, dict(dialog.result, name='第二个')]
             app._refresh_tree()
             app.update()
 
@@ -324,6 +391,49 @@ def check_gui_constructs():
             app.update()
             assert app.tree.item(rows[0], 'values')[0] == '☑', app.tree.item(rows[0], 'values')
             assert app.tree.item(rows[1], 'values')[0] == '☐', app.tree.item(rows[1], 'values')
+
+            # 上移 / 下移：列表顺序就是批量部署的顺序
+            assert [t['name'] for t in app.panel()['targets']] == ['检查', '第二个']
+            app.tree.selection_set('1')          # 选中第二条，把它挪上去
+            app._move_target(-1)
+            app.update()
+            assert [t['name'] for t in app.panel()['targets']] == ['第二个', '检查'], \
+                app.panel()['targets']
+            # 勾选是按下标记的，位置一换就得跟着走，否则勾的会变成另一条
+            assert app._picked == {1}, app._picked
+            assert app.tree.item(app.tree.get_children()[1], 'values')[0] == '☑'
+
+            # 已经在头尾就不动
+            app.tree.selection_set('0')
+            app._move_target(-1)
+            assert [t['name'] for t in app.panel()['targets']] == ['第二个', '检查']
+            app.tree.selection_set('1')
+            app._move_target(1)
+            assert [t['name'] for t in app.panel()['targets']] == ['第二个', '检查']
+
+            # 多面板：切换面板后列表和输入框都要跟着换
+            app.var_url.set('https://panel-1:8888')
+            app._persist_panel()
+            app.cfg['panels'].append(new_panel('第二台'))
+            app.cfg['active_panel'] = 1
+            app._load_active_panel()
+            app.update()
+            assert app.var_panel.get() == '第二台', app.var_panel.get()
+            assert app.var_url.get() == '', '新面板的地址应该是空的'
+            assert app.tree.get_children() == (), '新面板不该有部署目标'
+
+            app.var_url.set('https://panel-2:9999')
+            app._persist_panel()
+            assert app.cfg['panels'][1]['panel_url'] == 'https://panel-2:9999'
+            assert app.cfg['panels'][0]['panel_url'] == 'https://panel-1:8888', \
+                '写串面板了 —— 面板配置必须互相独立'
+
+            # 切回第一个面板，内容应该原样还在
+            app.var_panel.set('默认面板')
+            app._on_panel_switch()
+            app.update()
+            assert app.var_url.get() == 'https://panel-1:8888', app.var_url.get()
+            assert len(app.tree.get_children()) == 2, app.tree.get_children()
         except tk.TclError as exc:
             print(f'  跳过界面检查（无图形环境：{exc}）')
             return
@@ -343,6 +453,7 @@ def main():
     check_restart_dispatch()
     check_java_path_pick()
     check_site_and_java_parsing()
+    check_multi_panel()
     check_config_io()
     check_gui_constructs()
     print('\n全部自检通过。')
