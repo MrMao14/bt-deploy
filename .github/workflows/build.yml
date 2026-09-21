@@ -2,12 +2,8 @@ name: 打包
 
 on:
   push:
-    branches: ['**']       # 任何分支的提交都构建
-    tags: ['v*']           # 打 v 开头的 tag 也构建：git tag v1.0 && git push origin v1.0
-  release:
-    # 网页上「Publish release」时顺带创建的 tag 走的是 release 事件，不是 push 事件，
-    # 想从网页发版就得单独挂上这个；命令行推 tag 走上面的 push 就行
-    types: [published]
+    branches: ['**']       # 任何分支推送只跑测试打包，不建 Release
+    tags: ['v*']           # 提交新的 v* tag 时自动打包并发 Release
   workflow_dispatch:
 
 jobs:
@@ -36,22 +32,23 @@ jobs:
       - name: 打包
         run: python build.py
 
-      # .app 是个目录，直接传 artifact 会丢内部符号链接和权限，先压成 zip
-      - name: 压缩 .app
+      # macOS 创建无需解压的 .dmg 磁盘镜像，挂载后直接拖入应用程序运行
+      - name: 制作 macOS DMG 镜像
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent dist/bt-deploy.app dist/bt-deploy-macos.zip
+        run: |
+          hdiutil create -volname "宝塔部署助手" -srcfolder dist/bt-deploy.app -ov -format UDZO dist/bt-deploy.dmg
 
       - uses: actions/upload-artifact@v4
         with:
           name: bt-deploy-${{ matrix.os }}
           path: |
             dist/bt-deploy.exe
-            dist/bt-deploy-macos.zip
+            dist/bt-deploy.dmg
           if-no-files-found: error
 
   release:
     needs: build
-    # 只有 v* tag（命令行推 tag 或网页发版）才建 Release，分支提交和手动触发都不建
+    # 仅在提交新的 v* tag 时自动发 Release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10

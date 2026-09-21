@@ -142,20 +142,22 @@ python build.py
 
 PyInstaller **不能交叉编译**，Windows 包必须在 Windows 上打，mac 包必须在 mac 上打。
 
-不用自己打也行：**push 之后 GitHub Actions 会自动构建**（`.github/workflows/build.yml`），Windows 和 macOS 两个包并行跑，先跑自检再打包。产物在仓库的 **Actions → 对应的运行 → Artifacts** 里下载：`bt-deploy-windows-latest`（exe）和 `bt-deploy-macos-latest`（zip，解开就是 `.app`）。
+不用自己打也行：**push 之后 GitHub Actions 会自动构建**（`.github/workflows/build.yml`），Windows 和 macOS 两个包并行跑，先跑自检再打包。产物在仓库的 **Actions → 对应的运行 → Artifacts** 里下载：`bt-deploy-windows-latest`（exe）和 `bt-deploy-macos-latest`（dmg）。
 
 ### 发版（自动建 Release）
 
-打 `v*` 开头的 tag 就会自动发 Release，两个平台的包直接挂到 Release 页面上：
+只要本地打 `v*` 开头的 tag 并推送到 GitHub，就会自动创建对应的 GitHub Release：
 
 ```bash
-git tag v1.0
-git push origin v1.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-在**网页上发版**也行：Releases → Draft a new release → 新建 tag → Publish release。网页新建的 tag 走的是 `release` 事件、**不是** `push` 事件（GitHub 的行为，不是本项目的限制），所以 workflow 把两个事件都挂上了。注意草稿（Save draft）不算，要 Publish 才会跑。
-
-Release 的说明由 GitHub 按提交自动生成。tag 同名 Release 已存在时（比如重新跑一次）会复用并更新资产，不会覆盖你手写的说明。
+构建完成后，GitHub Release 的 Assets 列表将直接提供免解压的原生文件（每项独立一行）：
+- `bt-deploy.exe`：Windows 单文件可执行程序，双击直接运行
+- `bt-deploy.dmg`：macOS 磁盘镜像，双击直接挂载并拖入「应用程序」即可运行，免解压
+- `Source code (zip)`：GitHub 官方自动打包的项目源码 zip 压缩包
+- `Source code (tar.gz)`：GitHub 官方自动打包的项目源码 tar.gz 压缩包
 
 ## 自检
 
