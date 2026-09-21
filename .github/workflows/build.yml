@@ -1,0 +1,46 @@
+name: 打包
+
+on:
+  push:
+    branches: ['**']       # 任何分支的提交都构建
+    tags: ['v*']           # 打 v 开头的 tag 也构建：git tag v1.0 && git push origin v1.0
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20      # 界面自检万一卡住，别把 job 挂满 6 小时
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 装打包工具
+        run: pip install -r requirements.txt
+
+      - name: 自检
+        run: python selfcheck.py
+        env:
+          # macOS runner 没有桌面会话，Tk 会卡在等窗口可见；逻辑部分照常跑
+          BTDEPLOY_SKIP_GUI: ${{ runner.os == 'macOS' && '1' || '' }}
+      - name: 打包
+        run: python build.py
+
+      # .app 是个目录，直接传 artifact 会丢内部符号链接和权限，先压成 zip
+      - name: 压缩 .app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/bt-deploy.app dist/bt-deploy-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt-deploy-${{ matrix.os }}
+          path: |
+            dist/bt-deploy.exe
+            dist/bt-deploy-macos.zip
+          if-no-files-found: error
