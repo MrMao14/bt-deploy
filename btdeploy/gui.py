@@ -90,7 +90,7 @@ class TargetDialog(tk.Toplevel):
 
         kind_combo = ttk.Combobox(self.body, textvariable=self.var_kind, state='readonly',
                                   values=[label for _, label in RESTART_CHOICES], width=43)
-        kind_combo.bind('<<ComboboxSelected>>', lambda _e: self._sync_restart_fields())
+        kind_combo.bind('<<ComboboxSelected>>', self._on_kind_selected)
         self._row(row, '部署后动作', kind_combo)
         row += 1
 
@@ -211,6 +211,15 @@ class TargetDialog(tk.Toplevel):
             target = ()
         for widget in target:
             widget.grid()
+
+    def _on_kind_selected(self, _event=None):
+        """换动作会让对话框多出/少掉一整行（Java 项目名、服务名）。
+
+        窗口尺寸是构造时按内容定死的，不再量一次的话新行会把下面的
+        分隔线和保存/取消按钮顶到窗口外面，看得见却点不到。
+        """
+        self._sync_restart_fields()
+        self.resize_to_content(self.master)
 
     def _load_panel_data(self):
         """后台拉一次面板数据（网站根目录 + Java 项目名）填进下拉。

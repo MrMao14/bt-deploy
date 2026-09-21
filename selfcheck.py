@@ -428,6 +428,22 @@ def check_gui_constructs():
             assert dialog.row_project[1].winfo_manager() == '', '切换动作后该行应隐藏'
             assert dialog.row_service[1].winfo_manager() == '', '切换动作后该行应隐藏'
 
+            # 换动作会多出/少掉一整行，窗口尺寸是构造时定死的：不重新量一次，
+            # 新行会把保存/取消顶到窗口外面，看得见点不到
+            short = TargetDialog(app, {
+                'name': '尺寸检查', 'source_dirs': [str(Path(__file__).parent)],
+                'remote_dir': '/tmp/check', 'temp_dir': '/tmp',
+                'restart': {'type': 'none'},
+            })
+            short.update()
+            assert short.body.winfo_reqheight() <= short.winfo_height(), '默认动作下窗口就装不下内容'
+            short.var_kind.set(RESTART_LABELS['java_restart'])
+            short._on_kind_selected()
+            short.update()
+            assert short.body.winfo_reqheight() <= short.winfo_height(), \
+                '换成重启 Java 项目后窗口没跟着长高，按钮会被挤到窗口外面'
+            short.destroy()
+
             # _save 会销毁对话框，顺便拿到 result 做列表渲染检查
             assert dialog.var_keep_root.get() is True, '默认应该保留目录名'
             dialog.var_keep_root.set(False)
