@@ -9,6 +9,7 @@
 - PyInstaller 打包后是**单文件**，约 12–15 MB，不需要目标机器装 Python
 - 支持配置多套部署目标，配置存在本机
 - 关窗口可以缩到右下角通知区继续待在后台，行为随时能改（Windows 托盘同样只用标准库 ctypes 实现）
+- 界面上点「检查更新」就能去 GitHub 查最新版本；Windows 上可以一键下载、自动替换并重启（同样是标准库实现）
 
 ## 前置条件
 
@@ -32,6 +33,17 @@
 4. 点「**开始部署**」—— 列表**第一列可以勾选**，勾了一个以上就按从上到下的顺序批量部署；一个都不勾则只部署当前高亮的那一个
 5. 日志区会实时输出每一步结果
 
+### 更新到新版本
+
+日志区左下角的「**检查更新（v…）**」按钮会去 GitHub 查最新 release（按钮上写的就是当前版本号）：
+
+- 已是最新、网络不通、或这次 release 里没有本平台的包 —— 都只在日志里说一句，不打扰你
+- 有新版 —— 弹窗问一句，确认后开始下载
+- **Windows**：再确认一次「替换并重启」，程序退出，新文件覆盖旧 exe 后自动重新启动
+- **macOS**：下载好的 `.dmg` 会自动打开，拖进「应用程序」覆盖旧版即可（`.app` 换不了自己）
+
+放在 `Program Files` 这类需要管理员权限的目录里时覆盖会失败，那就手动替换。从源码直接跑时也不会动你的工作目录，只把包下到临时目录再把路径告诉你。
+
 ### 关窗口时是退出还是缩到托盘
 
 **第一次**点关闭按钮会问一句：退出程序，还是最小化到右下角的通知区。勾上「记住我的选择」之后就不再问。
@@ -42,6 +54,7 @@
 
 - **双击图标** —— 恢复窗口
 - **右键图标** —— 「显示主窗口」/「退出程序」
+- **再双击一次 exe** —— 只会把已经在跑的那个窗口叫出来，不会再开第二个
 
 非 Windows 系统建不出通知区图标，会自动降级成最小化到任务栏。
 ### 管多台服务器（多面板）
@@ -140,6 +153,19 @@ python build.py
 - Windows → `dist/bt-deploy.exe`
 - macOS → `dist/bt-deploy.app`
 
+
+产物自带图标和版本信息：
+
+- **图标**：来自 `assets/icon.svg`，导出成 `assets/icon.png` 后由 PyInstaller 转成 Windows 的 `.ico` / macOS 的 `.icns`，通知区托盘图标也用同一个（打包运行时直接读 exe 自己的图标资源）。
+- **署名与版本号**：取自 `btdeploy/__init__.py` 的 `__author__` / `__version__`，写进 Windows exe 的版本资源 —— 右键「属性 → 详细信息」能看到公司、文件版本、版权；macOS 的 bundle id 也是由 `__author__` 拼出来的。
+
+改过 `assets/icon.svg` 之后要重新导出 PNG 再打包（PyInstaller 只认位图）：
+
+```bash
+# Edge / Chrome 的无头截图就够用，不需要装任何图像库
+msedge --headless=new --hide-scrollbars --default-background-color=00000000 \
+       --window-size=1024,1024 --screenshot=assets/icon.png assets/icon.svg
+```
 PyInstaller **不能交叉编译**，Windows 包必须在 Windows 上打，mac 包必须在 mac 上打。
 
 不用自己打也行：**push 之后 GitHub Actions 会自动构建**（`.github/workflows/build.yml`），Windows 和 macOS 两个包并行跑，先跑自检再打包。产物在仓库的 **Actions → 对应的运行 → Artifacts** 里下载：`bt-deploy-windows-latest`（exe）和 `bt-deploy-macos-latest`（dmg）。
@@ -152,6 +178,8 @@ PyInstaller **不能交叉编译**，Windows 包必须在 Windows 上打，mac �
 git tag v1.0.0
 git push origin v1.0.0
 ```
+
+发版前记得把 `btdeploy/__init__.py` 里的 `__version__` 改成同一个版本号 —— 它既是 exe 版本资源里的版本，也是程序里「检查更新」比较用的当前版本。
 
 构建完成后，GitHub Release 的 Assets 列表将直接提供免解压的原生文件（每项独立一行）：
 - `bt-deploy.exe`：Windows 单文件可执行程序，双击直接运行
@@ -232,6 +260,9 @@ btdeploy/api.py       宝塔 API 客户端（签名、三种请求、业务封�
 btdeploy/deploy.py    配置读写、本地打包、五步部署流程
 btdeploy/gui.py       Tkinter 界面
 btdeploy/tray.py      Windows 通知区图标（ctypes 调 Shell_NotifyIcon）
+btdeploy/update.py    GitHub 版本检查与自更新（下载、替换、重启）
 selfcheck.py          自检脚本
 build.py              PyInstaller 打包脚本
+assets/icon.svg       应用图标设计稿（导出 icon.png 供打包用）
+assets/icon.png       打包用位图图标，由 icon.svg 导出
 ```

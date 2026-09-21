@@ -10,12 +10,13 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from . import __version__, update
 from .api import BtApiError, BtClient
 from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, NEW_TARGET,
                      RESTART_CHOICES, RESTART_LABELS, deploy, export_targets,
                      load_config, merge_targets, new_panel, save_config,
                      target_sources)
-from .tray import TrayIcon
+from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
 
 
@@ -343,7 +344,7 @@ class CloseChoiceDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('宝塔部署助手')
+        self.title(APP_TITLE)
         self.geometry('920x680')
         self.minsize(760, 520)
 
@@ -456,6 +457,8 @@ class App(tk.Tk):
         footer = ttk.Frame(box)
         footer.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
         ttk.Button(footer, text='清空日志', command=self._clear_log).pack(side='left')
+        ttk.Button(footer, text=f'检查更新（v{__version__}）',
+                   command=self._check_update).pack(side='left', padx=(PAD, 0))
 
         # 关闭行为是全局设置，不属于任何一个面板
         self.combo_close = ttk.Combobox(footer, state='readonly', width=13,
@@ -742,23 +745,92 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- 任务执行
 
-    def _run_async(self, title: str, work):
+    def _run_async(self, title: str, work, on_done=None):
+        """后台跑 work()。跑完整、且返回值不是 None 时，回主线程执行 on_done(返回值)。
+
+        work 自己把「没事发生」处理掉就行 —— 返回 None 就不会触发 on_done。
+        """
         if self._busy:
             return
         self._set_busy(True)
         self._log(f'—— {title} ——')
 
         def runner():
+            result = None
             try:
-                work()
+                result = work()
             except BtApiError as exc:
                 self._log(f'❌ {exc}')
             except Exception as exc:  # 兜底，别让线程静默死掉
                 self._log(f'❌ 未预期的错误：{type(exc).__name__}: {exc}')
             finally:
-                self.after(0, lambda: self._set_busy(False))
+                self.after(0, lambda: self._finish_task(result, on_done))
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_task(self, result, on_done):
+        """线程收尾：先解除忙状态再交回结果，on_done 里就能接着发起下一个任务。"""
+        self._set_busy(False)
+        if on_done is not None and result is not None:
+            on_done(result)
+
+    # ------------------------------------------------------------- 检查更新
+
+    def _check_update(self):
+        """后台问一次 GitHub。只有确实有新版才弹窗，其余情况都只在日志里说一句。"""
+        def work():
+            try:
+                info = update.latest_release()
+            except update.UpdateError as exc:
+                self._log(f'❌ 检查更新失败：{exc}')
+                return None
+            if not update.is_newer(info['version']):
+                self._log(f'✅ 已是最新版本（v{__version__}）')
+                return None
+            self._log(f'🎉 发现新版本 {info["version"]}（当前 v{__version__}）：{info["page"]}')
+            return info
+
+        self._run_async('检查更新', work, self._on_update_found)
+
+    def _on_update_found(self, info: dict):
+        version, url = info['version'], info['url']
+        if not url:
+            messagebox.showinfo('发现新版本',
+                                f'{version} 已发布，但这个 release 里没有适合本机的安装包。\n\n'
+                                f'{info["page"]}')
+            return
+        if not messagebox.askyesno('发现新版本',
+                                   f'最新版本：{version}\n当前版本：v{__version__}\n\n现在下载吗？'):
+            return
+
+        def work():
+            try:
+                return update.download(url)
+            except update.UpdateError as exc:
+                self._log(f'❌ 下载失败：{exc}')
+                return None
+
+        self._run_async(f'下载 {version}', work, lambda path: self._on_downloaded(version, path))
+
+    def _on_downloaded(self, version: str, path):
+        """新包已经在盘上了：Windows 换掉自己，其他平台交给用户手动装。"""
+        if not update.can_self_update():
+            self._log(f'✅ 新版本已下载到 {path}')
+            messagebox.showinfo('下载完成',
+                                f'{version} 已下载到：\n{path}\n\n'
+                                '关闭程序后用它替换掉旧文件即可。')
+            update.open_download(path)
+            return
+        if not messagebox.askyesno('准备更新',
+                                   '程序会退出，由新版本替换旧文件并自动重新启动。\n\n继续吗？'):
+            return
+        try:
+            update.apply_update(path)
+        except OSError as exc:
+            messagebox.showerror('更新失败', f'替换脚本没起来：{exc}')
+            return
+        self._log('正在退出，新版本马上接管…')
+        self._quit()
 
     def _test_connection(self):
         try:
@@ -895,7 +967,7 @@ class App(tk.Tk):
     def _hide_to_tray(self):
         """缩到通知区。图标建不出来（非 Windows 等）就退回任务栏最小化。"""
         if self._tray is None:
-            icon = TrayIcon('宝塔部署助手')
+            icon = TrayIcon()
             if icon.start():
                 self._tray = icon
                 self.after(120, self._drain_tray)
@@ -932,4 +1004,7 @@ class App(tk.Tk):
 
 
 def run():
+    if not acquire_single_instance():
+        wake_existing()      # 已经在跑了：把这个新来的进程的活儿变成叫出旧窗口
+        return
     App().mainloop()

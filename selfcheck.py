@@ -20,6 +20,7 @@ from btdeploy.api import BtApiError, BtClient
 from btdeploy.deploy import (CLOSE_LABELS, RESTART_LABELS, _migrate_config, build_zip,
                              export_targets, merge_targets, new_panel,
                              restart_service, target_sources)
+from btdeploy import tray, update
 
 # Windows 控制台默认用 GBK，直接打印 emoji 会 UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
@@ -262,6 +263,31 @@ def check_close_action():
     print('✅ 关闭窗口行为的默认值与兜底')
 
 
+def check_single_instance():
+    """单实例互斥体 + 唤醒已有窗口。用自检专名，免得撞上真在跑的本程序。"""
+    tray.MUTEX_NAME = 'Local\\BtDeploySelfCheck'
+    assert tray.acquire_single_instance() is True, '第一个实例应该拿得到锁'
+    if tray.AVAILABLE:
+        assert tray.acquire_single_instance() is False, '第二个实例不该拿到锁'
+        tray.wake_existing()     # 没有窗口可叫也不能抛
+    print('✅ 单实例互斥体 / 唤醒已有窗口')
+
+
+def check_version_compare():
+    """版本号比较：v 前缀、位数不齐、两位数都不能判错。"""
+    assert update.parse_version('v1.2.3') == (1, 2, 3)
+    assert update.parse_version('1.2-beta') == (1, 2)
+    assert update.parse_version('') == ()
+    assert update.is_newer('v1.0.1', '1.0.0')
+    assert update.is_newer('v1.10.0', '1.9.9'), '两位数不能按字符串比'
+    assert not update.is_newer('v1.2', '1.2.0'), '位数不齐要按 1.2.0 处理'
+    assert update.is_newer('v1.2.1', '1.2')
+    assert not update.is_newer('v1.0.0', '1.0.0')
+    assert not update.is_newer('', '1.0.0'), '拿不到 tag 不能算有新版本'
+    assert update.is_newer('v99.0.0'), '默认要拿当前版本比'
+    print('✅ 版本号解析与比较')
+
+
 def check_site_and_java_parsing():
     """用伪造的面板响应验证字段解析 —— 真实面板的字段名没法离线确认。"""
     client = BtClient('http://127.0.0.1:8888', 'KEY')
@@ -501,6 +527,8 @@ def main():
     check_multi_panel()
     check_config_io()
     check_close_action()
+    check_single_instance()
+    check_version_compare()
     check_gui_constructs()
     print('\n全部自检通过。')
 

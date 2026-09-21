@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256" role="img" aria-label="宝塔部署助手">
+  <!-- 应用图标：蓝青渐变底 + 三层宝塔剪影。改完记得重新导出 assets/icon.png（见 README） -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2f6bff"/>
+      <stop offset="1" stop-color="#10b8c8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <!-- 塔刹、塔尖、飞檐、塔基：白色 -->
+  <g fill="#ffffff">
+    <circle cx="128" cy="52" r="9"/>
+    <polygon points="128,62 146,104 110,104"/>
+    <rect x="74" y="100" width="108" height="16" rx="8"/>
+    <rect x="60" y="146" width="136" height="16" rx="8"/>
+    <rect x="56" y="196" width="144" height="18" rx="9"/>
+  </g>
+
+  <!-- 塔身：淡蓝，缩小到 16px 时也能看出层次 -->
+  <g fill="#cfe1ff">
+    <rect x="96" y="116" width="64" height="30"/>
+    <rect x="88" y="162" width="80" height="34"/>
+  </g>
+</svg>

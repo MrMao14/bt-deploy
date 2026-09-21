@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import queue
 import sys
 import threading
 
 AVAILABLE = sys.platform == 'win32'
+
+APP_TITLE = '宝塔部署助手'
+TRAY_CLASS = 'BtDeployTray'                 # 固定类名：第二个实例靠它找到托盘窗口
+MUTEX_NAME = 'Local\\BtDeployAssistant'     # 单实例互斥体名
 
 # 菜单项 id
 MENU_SHOW = 1
@@ -34,12 +37,15 @@ if AVAILABLE:
     WM_RBUTTONUP = 0x0205
     WM_APP = 0x8000
     WM_TRAY = WM_APP + 1
+    WM_TRAY_SHOW = WM_APP + 2
 
     NIM_ADD, NIM_DELETE = 0, 2
     NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
     IDI_APPLICATION = 32512
     MF_STRING = 0x0000
     TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x0002, 0x0100
+    SW_RESTORE = 9
+    ERROR_ALREADY_EXISTS = 183
 
     WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
                                  wintypes.WPARAM, wintypes.LPARAM)
@@ -105,6 +111,9 @@ if AVAILABLE:
     _user32.DestroyMenu.argtypes = (wintypes.HANDLE,)
     _kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
     _kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    _kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    _kernel32.CreateMutexW.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     _shell32.Shell_NotifyIconW.argtypes = (wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW))
     _user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                                     wintypes.LPARAM)
@@ -117,12 +126,48 @@ if AVAILABLE:
     _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
     _user32.SetForegroundWindow.restype = wintypes.BOOL
     _shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    _user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    _user32.FindWindowW.restype = wintypes.HWND
+    _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+
+
+_mutex = None   # 句柄留着引用，进程退出系统自己回收
+
+
+def acquire_single_instance() -> bool:
+    """第一个实例返回 True；已经有同名互斥体（程序已经在跑）返回 False。"""
+    global _mutex
+    if not AVAILABLE:
+        return True
+    handle = _kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if not handle:
+        return True                     # 互斥体都建不出来就别拦着人启动
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        return False
+    _mutex = handle
+    return True
+
+
+def wake_existing():
+    """把已经在跑的那个窗口叫到前面来。"""
+    if not AVAILABLE:
+        return
+    hwnd = _user32.FindWindowW(TRAY_CLASS, None)
+    if hwnd:
+        # 缩在托盘里：托盘窗口收到消息会自己 deiconify，不必硬改窗口状态
+        _user32.PostMessageW(hwnd, WM_TRAY_SHOW, 0, 0)
+        return
+    hwnd = _user32.FindWindowW(None, APP_TITLE)
+    if hwnd:
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+        _user32.SetForegroundWindow(hwnd)
 
 
 class TrayIcon:
     """通知区里的一个小图标：双击还原窗口，右键出「显示/退出」菜单。"""
 
-    def __init__(self, tooltip: str = '宝塔部署助手'):
+    def __init__(self, tooltip: str = APP_TITLE):
         self.tooltip = tooltip[:127]
         self.events: queue.Queue[str] = queue.Queue()
         self._ready = threading.Event()
@@ -165,6 +210,17 @@ class TrayIcon:
             _user32.TranslateMessage(ctypes.byref(msg))
             _user32.DispatchMessageW(ctypes.byref(msg))
 
+    @staticmethod
+    def _icon():
+        """优先用 exe 里打包好的图标（PyInstaller 写进去的资源 id 1），
+
+        源码直接跑时没有这个资源，退回系统默认图标。"""
+        if getattr(sys, 'frozen', False):
+            handle = _user32.LoadIconW(_kernel32.GetModuleHandleW(None), ctypes.c_void_p(1))
+            if handle:
+                return handle
+        return _user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+
     def _create(self):
         instance = _kernel32.GetModuleHandleW(None)
         self._proc = WNDPROC(self._wndproc)
@@ -172,7 +228,6 @@ class TrayIcon:
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._proc
         wc.hInstance = instance
-        wc.lpszClassName = f'BtDeployTray_{os.getpid()}'
         if not _user32.RegisterClassW(ctypes.byref(wc)):
             raise OSError('注册托盘窗口类失败')
 
@@ -187,7 +242,7 @@ class TrayIcon:
         data.uID = 1
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         data.uCallbackMessage = WM_TRAY
-        data.hIcon = _user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+        data.hIcon = self._icon()
         data.szTip = self.tooltip
         if not _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
             raise OSError('添加托盘图标失败')
@@ -201,6 +256,8 @@ class TrayIcon:
                     self.events.put('show')
                 elif lparam == WM_RBUTTONUP:
                     self._popup_menu(hwnd)
+            elif msg == WM_TRAY_SHOW:
+                self.events.put('show')
             elif msg == WM_CLOSE:
                 _user32.DestroyWindow(hwnd)
             elif msg == WM_DESTROY:
