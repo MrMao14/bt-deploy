@@ -18,6 +18,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 控制台默认不是 UTF-8（CI 的 runner 上甚至是 cp1252），直接打印中文会 UnicodeEncodeError
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 ROOT = Path(__file__).resolve().parent
 
 # 单文件体积基本由内置的 tcl/tk 决定，能砍的主要是这些用不到的第三方大库
