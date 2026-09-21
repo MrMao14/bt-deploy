@@ -3,7 +3,7 @@ name: 打包
 on:
   push:
     branches: ['**']       # 任何分支推送只跑测试打包，不建 Release
-    tags: ['v*']           # 提交新的 v* tag 时自动打包并发 Release
+    tags: ['v*', 'V*']     # 兼容小写 v 与大写 V（如 v1.0.0 和 V1.0.0）
   workflow_dispatch:
 
 jobs:
@@ -48,8 +48,8 @@ jobs:
 
   release:
     needs: build
-    # 仅在提交新的 v* tag 时自动发 Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 只要是 tag 推送（无论小写 v 还是大写 V），就自动创建并发布 Release
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/V')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
