@@ -2,7 +2,6 @@ name: 打包
 
 on:
   push:
-    branches: ['**']       # 任何分支推送只跑测试打包，不建 Release
     tags: ['v*', 'V*']     # 兼容小写 v 与大写 V（如 v1.0.0 和 V1.0.0）
   workflow_dispatch:
 
@@ -13,7 +12,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20      # 界面自检万一卡住，别把 job 挂满 6 小时
+    timeout-minutes: 3      # 界面自检万一卡住，别把 job 挂满 6 小时
     steps:
       - uses: actions/checkout@v4
 
