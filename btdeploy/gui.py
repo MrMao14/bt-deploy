@@ -140,10 +140,17 @@ class TargetDialog(tk.Toplevel):
         for item in target_sources(self.data):
             self.list_src.insert('end', item)
 
-        # 路径长的时候横向也看不全，选中哪条就在下面把完整路径折行显示出来
-        self.lbl_full = ttk.Label(box, text='', wraplength=430, justify='left',
-                                  foreground='#555')
-        self.lbl_full.grid(row=2, column=0, columnspan=2, sticky='w', pady=(3, 0))
+        # 路径长的时候横向也看不全，选中哪条就在下面把完整路径折行显示出来。
+        # 这里必须用 Text 而不是 Label：Label 的请求尺寸会跟着文字一起涨，长路径会把
+        # 对话框的布局整个撑大，而窗口不可调整大小，保存/取消就被顶到可视区外面点不到了。
+        # Text 的宽高写死（1 字符宽，靠 sticky 撑满），长路径在里面折行，滚轮继续看。
+        self.txt_full = tk.Text(box, height=3, width=1, wrap='char', state='disabled',
+                                relief='flat', borderwidth=0, highlightthickness=0,
+                                background=self.cget('background'), foreground='#555')
+        self.txt_full.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(3, 0))
+        # 只读（disabled）的 Text 自己不吃滚轮，长路径得手动接一下
+        self.txt_full.bind('<MouseWheel>', lambda event: self.txt_full.yview_scroll(
+            -1 if event.delta > 0 else 1, 'units'))
 
         buttons = ttk.Frame(box)
         buttons.grid(row=0, column=2, sticky='n', padx=(6, 0))
@@ -176,7 +183,10 @@ class TargetDialog(tk.Toplevel):
 
     def _show_full_path(self, _event=None):
         picked = self.list_src.curselection()
-        self.lbl_full.configure(text=self.list_src.get(picked[0]) if picked else '')
+        self.txt_full.configure(state='normal')
+        self.txt_full.delete('1.0', 'end')
+        self.txt_full.insert('1.0', self.list_src.get(picked[0]) if picked else '')
+        self.txt_full.configure(state='disabled')
 
     def _sync_restart_fields(self):
         kind = self._kind()
