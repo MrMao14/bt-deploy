@@ -8,6 +8,7 @@
 - 跨平台图形界面，Windows / macOS 都能跑
 - PyInstaller 打包后是**单文件**，约 12–15 MB，不需要目标机器装 Python
 - 支持配置多套部署目标，配置存在本机
+- 关窗口可以缩到右下角通知区继续待在后台，行为随时能改（Windows 托盘同样只用标准库 ctypes 实现）
 
 ## 前置条件
 
@@ -31,6 +32,18 @@
 4. 点「**开始部署**」—— 列表**第一列可以勾选**，勾了一个以上就按从上到下的顺序批量部署；一个都不勾则只部署当前高亮的那一个
 5. 日志区会实时输出每一步结果
 
+### 关窗口时是退出还是缩到托盘
+
+**第一次**点关闭按钮会问一句：退出程序，还是最小化到右下角的通知区。勾上「记住我的选择」之后就不再问。
+
+想改回来：主界面日志区右下角的「关闭窗口时」下拉框，随时能换成「每次询问 / 退出程序 / 最小化到托盘」。
+
+缩到通知区之后：
+
+- **双击图标** —— 恢复窗口
+- **右键图标** —— 「显示主窗口」/「退出程序」
+
+非 Windows 系统建不出通知区图标，会自动降级成最小化到任务栏。
 ### 管多台服务器（多面板）
 
 顶部「面板」下拉里可以放任意多台服务器，每台的**地址、密钥、部署目标都是独立的**，互不影响。
@@ -129,6 +142,10 @@ python build.py
 
 PyInstaller **不能交叉编译**，Windows 包必须在 Windows 上打，mac 包必须在 mac 上打。
 
+不用自己打也行：**push 之后 GitHub Actions 会自动构建**（`.github/workflows/build.yml`），Windows 和 macOS 两个包并行跑，先跑自检再打包。产物在仓库的 **Actions → 对应的运行 → Artifacts** 里下载：`bt-deploy-windows-latest`（exe）和 `bt-deploy-macos-latest`（zip，解开就是 `.app`）。
+
+打 `v*` 开头的 tag（`git tag v1.0 && git push origin v1.0`）会触发同一套构建，只是把包传到该次运行的 Artifacts 里 —— 不建 Release。想发布版本就去那次运行里下载再手动传。
+
 ## 自检
 
 不需要网络和面板，验证签名算法、multipart 编码、zip 路径和重启分发逻辑：
@@ -136,6 +153,8 @@ PyInstaller **不能交叉编译**，Windows 包必须在 Windows 上打，mac �
 ```bash
 python selfcheck.py
 ```
+
+界面部分要能开窗口；纯命令行或无桌面环境下设 `BTDEPLOY_SKIP_GUI=1` 只跑逻辑检查（CI 上的 macOS 就是这么跑的）。
 
 ## 配置文件
 
@@ -152,6 +171,7 @@ API 密钥以明文存在里面（保存时会尝试设成 `600` 权限，Window
 {
   "version": 2,
   "active_panel": 0,
+  "close_action": "ask",
   "panels": [
     {
       "name": "生产服务器",
@@ -166,6 +186,8 @@ API 密钥以明文存在里面（保存时会尝试设成 `600` 权限，Window
 
 旧的单面板配置（顶层直接是 `panel_url` / `api_sk` / `targets`）**打开时会自动升级**成上面这个结构，升级后原来的目标和密钥都在，不用手动改。
 
+`close_action` 是关窗口的行为，取值 `ask`（每次询问）、`exit`（退出程序）、`tray`（最小化到托盘）；界面上改了会立刻写回来。
+
 ## 已知限制
 
 - **解压是覆盖式的**，远程目录里多余的旧文件不会被删除。需要完全干净的话，先手动清空目标目录再部署。
@@ -173,6 +195,7 @@ API 密钥以明文存在里面（保存时会尝试设成 `600` 权限，Window
 - 面板 API 没有执行任意 shell 命令的能力，所有动作都受限于面板已有的接口。
 - zip 一次性读进内存后上传，几百 MB 以内没问题，再大需要改成分片上传。
 - Java 项目重启接口是**异步**的，返回「操作已执行」只代表指令已下发，不代表进程已经起来。
+- 缩到通知区的图标用的是 Windows 默认图标；**explorer.exe 重启**（崩溃恢复或「结束任务」）会让图标从通知区消失，重新打开程序即可。
 - 宝塔官方声明 API 接口可能随面板版本变化，不保证长期稳定。本项目的接口依据 [docs.bt.cn/api](https://docs.bt.cn/api)（面板 v11.7.0）。
 
 ## 接口对照
@@ -195,6 +218,7 @@ main.py               入口
 btdeploy/api.py       宝塔 API 客户端（签名、三种请求、业务封装）
 btdeploy/deploy.py    配置读写、本地打包、五步部署流程
 btdeploy/gui.py       Tkinter 界面
+btdeploy/tray.py      Windows 通知区图标（ctypes 调 Shell_NotifyIcon）
 selfcheck.py          自检脚本
 build.py              PyInstaller 打包脚本
 ```

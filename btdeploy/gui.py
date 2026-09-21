@@ -11,11 +11,24 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .api import BtApiError, BtClient
-from .deploy import (NEW_TARGET, RESTART_CHOICES, RESTART_LABELS, deploy,
-                     export_targets, load_config, merge_targets, new_panel,
-                     save_config, target_sources)
-
+from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, NEW_TARGET,
+                     RESTART_CHOICES, RESTART_LABELS, deploy, export_targets,
+                     load_config, merge_targets, new_panel, save_config,
+                     target_sources)
+from .tray import TrayIcon
 PAD = 6
+
+
+def center_on(master, window):
+    """按内容定尺寸并居中到父窗口 —— Tk 默认会把 Toplevel 丢到屏幕左上角。"""
+    window.update_idletasks()
+    width, height = window.winfo_reqwidth(), window.winfo_reqheight()
+    x = master.winfo_rootx() + (master.winfo_width() - width) // 2
+    y = master.winfo_rooty() + (master.winfo_height() - height) // 2
+    # 别跑到屏幕外面去
+    x = max(0, min(x, window.winfo_screenwidth() - width))
+    y = max(0, min(y, window.winfo_screenheight() - height))
+    window.geometry(f'{width}x{height}+{x}+{y}')
 
 
 class TargetDialog(tk.Toplevel):
@@ -99,15 +112,7 @@ class TargetDialog(tk.Toplevel):
         self.focus_set()
 
     def resize_to_content(self, master):
-        """按内容定尺寸并居中到父窗口 —— Tk 默认会把 Toplevel 丢到屏幕左上角。"""
-        self.update_idletasks()
-        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
-        x = master.winfo_rootx() + (master.winfo_width() - width) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - height) // 2
-        # 别跑到屏幕外面去
-        x = max(0, min(x, self.winfo_screenwidth() - width))
-        y = max(0, min(y, self.winfo_screenheight() - height))
-        self.geometry(f'{width}x{height}+{x}+{y}')
+        center_on(master, self)
 
     def _row(self, row: int, text: str, widget: tk.Widget):
         """一行 = 标签 + 控件。两个都返回，隐藏整行时要一起处理。"""
@@ -287,6 +292,44 @@ class TargetDialog(tk.Toplevel):
         }
         self.destroy()
 
+class CloseChoiceDialog(tk.Toplevel):
+    """第一次关窗口时问一句：退出程序，还是缩到通知区。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title('关闭窗口时')
+        self.transient(master)
+        self.resizable(False, False)
+        self.result: tuple[str, bool] | None = None
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='点关闭按钮之后，程序该怎么做？').pack(anchor='w')
+        ttk.Label(body, text='之后可以在主界面右下角随时改。',
+                  foreground='#666').pack(anchor='w', pady=(4, 0))
+
+        self.var_remember = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text='记住我的选择，以后不再询问',
+                        variable=self.var_remember).pack(anchor='w', pady=(12, 14))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x')
+        ttk.Button(buttons, text='最小化到托盘',
+                   command=lambda: self._pick('tray')).pack(side='right')
+        ttk.Button(buttons, text='退出程序',
+                   command=lambda: self._pick('exit')).pack(side='right', padx=(0, PAD))
+
+        self.protocol('WM_DELETE_WINDOW', self.destroy)   # 关掉 = 这次算了，什么都不改
+        self.bind('<Escape>', lambda _e: self.destroy())
+        center_on(master, self)
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+
+    def _pick(self, action: str):
+        self.result = (action, bool(self.var_remember.get()))
+        self.destroy()
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -298,6 +341,7 @@ class App(tk.Tk):
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._busy = False
         self._picked: set[int] = set()
+        self._tray: TrayIcon | None = None
 
         self._build_panel()
         self._build_targets()
@@ -399,7 +443,17 @@ class App(tk.Tk):
         box.rowconfigure(0, weight=1)
         box.columnconfigure(0, weight=1)
 
-        ttk.Button(box, text='清空日志', command=self._clear_log).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
+        footer = ttk.Frame(box)
+        footer.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
+        ttk.Button(footer, text='清空日志', command=self._clear_log).pack(side='left')
+
+        # 关闭行为是全局设置，不属于任何一个面板
+        self.combo_close = ttk.Combobox(footer, state='readonly', width=13,
+                                        values=[label for _, label in CLOSE_CHOICES])
+        self.combo_close.pack(side='right')
+        self.combo_close.bind('<<ComboboxSelected>>', self._on_close_action_changed)
+        ttk.Label(footer, text='关闭窗口时：').pack(side='right', padx=(0, PAD))
+        self._sync_close_action()
 
     # ------------------------------------------------------------- 小工具
 
@@ -780,11 +834,91 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- 退出
 
+    def _close_action(self) -> str:
+        """当前配置的关闭行为；存着不认识的值就按「每次询问」处理。"""
+        action = self.cfg.get('close_action')
+        return action if action in CLOSE_LABELS else CLOSE_ASK
+
+    def _sync_close_action(self):
+        self.combo_close.set(CLOSE_LABELS[self._close_action()])
+
+    def _on_close_action_changed(self, _event=None):
+        for value, label in CLOSE_CHOICES:
+            if label == self.combo_close.get():
+                self.cfg['close_action'] = value
+                save_config(self.cfg)
+                return
+
     def _on_close(self):
+        action = self._close_action()
+        if action == CLOSE_ASK:
+            action = self._ask_close_action()
+            if action is None:
+                return      # 对话框被关掉了，这次不关窗口
+        if action == 'tray':
+            self._hide_to_tray()
+            return
         if self._busy and not messagebox.askyesno('确认', '正在部署中，确定要退出吗？'):
             return
+        self._quit()
+
+    def _ask_close_action(self) -> str | None:
+        """没定过关闭行为时问一次；勾了「记住」就写进配置，以后不再问。"""
+        dialog = CloseChoiceDialog(self)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return None
+        action, remember = dialog.result
+        if remember:
+            self.cfg['close_action'] = action
+            save_config(self.cfg)
+            self._sync_close_action()
+        return action
+
+    def _quit(self):
+        self._stop_tray()
         self._persist_panel()
         self.destroy()
+
+    # ------------------------------------------------------------- 通知区图标
+
+    def _hide_to_tray(self):
+        """缩到通知区。图标建不出来（非 Windows 等）就退回任务栏最小化。"""
+        if self._tray is None:
+            icon = TrayIcon('宝塔部署助手')
+            if icon.start():
+                self._tray = icon
+                self.after(120, self._drain_tray)
+                self._log('已缩到右下角通知区：双击图标恢复窗口，右键可以退出')
+            else:
+                self._log('这个系统不支持通知区图标，改为最小化到任务栏')
+        if self._tray is not None:
+            self.withdraw()
+        else:
+            self.iconify()
+
+    def _drain_tray(self):
+        """托盘线程只往队列里塞动作，取走和动界面都留在这个线程。"""
+        if self._tray is None:
+            return
+        while True:
+            try:
+                action = self._tray.events.get_nowait()
+            except queue.Empty:
+                break
+            if action == 'show':
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+            elif action == 'exit':
+                self._quit()
+                return
+        self.after(120, self._drain_tray)
+
+    def _stop_tray(self):
+        if self._tray is not None:
+            self._tray.stop()
+            self._tray = None
 
 
 def run():

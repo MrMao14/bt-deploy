@@ -9,6 +9,7 @@ from __future__ import annotations
 import email
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -16,7 +17,7 @@ import zipfile
 from pathlib import Path
 
 from btdeploy.api import BtApiError, BtClient
-from btdeploy.deploy import (RESTART_LABELS, _migrate_config, build_zip,
+from btdeploy.deploy import (CLOSE_LABELS, RESTART_LABELS, _migrate_config, build_zip,
                              export_targets, merge_targets, new_panel,
                              restart_service, target_sources)
 
@@ -248,6 +249,19 @@ def check_config_io():
     print('✅ 导出不含密钥 / 导入按名称合并')
 
 
+def check_close_action():
+    """关闭窗口行为：老配置按「每次询问」，坏值也得兜住。"""
+    assert set(CLOSE_LABELS) == {'ask', 'exit', 'tray'}, CLOSE_LABELS
+    assert _migrate_config({})['close_action'] == 'ask'
+    assert _migrate_config({'panel_url': 'https://old:8888'})['close_action'] == 'ask'
+    for action in ('exit', 'tray'):
+        assert _migrate_config({'close_action': action})['close_action'] == action
+    # 手改配置或旧文件里塞了怪值，不能把界面带崩
+    for bad in ('nonsense', None, 42, ['tray'], {'a': 1}):
+        assert _migrate_config({'close_action': bad})['close_action'] == 'ask', bad
+    print('✅ 关闭窗口行为的默认值与兜底')
+
+
 def check_site_and_java_parsing():
     """用伪造的面板响应验证字段解析 —— 真实面板的字段名没法离线确认。"""
     client = BtClient('http://127.0.0.1:8888', 'KEY')
@@ -313,6 +327,10 @@ def check_restart_dispatch():
 
 def check_gui_constructs():
     """构造一遍主窗口和编辑对话框，抓布局管理器冲突这类低级错误。"""
+    # CI 上没有桌面会话时 Tk 会卡在等窗口可见，用这个开关只跳过界面部分
+    if os.environ.get('BTDEPLOY_SKIP_GUI'):
+        print('⏭  跳过界面检查（BTDEPLOY_SKIP_GUI）')
+        return
     try:
         import tkinter as tk
     except ImportError as exc:
@@ -434,14 +452,41 @@ def check_gui_constructs():
             app.update()
             assert app.var_url.get() == 'https://panel-1:8888', app.var_url.get()
             assert len(app.tree.get_children()) == 2, app.tree.get_children()
+
+            # 关闭窗口行为：默认「每次询问」，下拉框改完要落到配置里
+            assert app.combo_close.get() == '每次询问', app.combo_close.get()
+            app.combo_close.set('最小化到托盘')
+            app._on_close_action_changed()
+            assert app.cfg['close_action'] == 'tray', app.cfg
+            app._sync_close_action()
+            assert app.combo_close.get() == '最小化到托盘', app.combo_close.get()
+
+            # 选「缩到托盘」时关窗口不该退出。真建图标要 Windows 桌面，这里只验分支
+            hidden = []
+            app._hide_to_tray = lambda: hidden.append(True)
+            app._on_close()
+            assert hidden == [True], '关窗口没走托盘分支'
+            assert app.winfo_exists(), '缩到托盘时窗口不该销毁'
+
+            # 选「退出程序」时关窗口要真的走销毁 —— 这条放最后，之后窗口就没了
+            app.cfg['close_action'] = 'exit'
+            app._on_close()
+            try:
+                alive = bool(app.winfo_exists())
+            except tk.TclError:
+                alive = False
+            assert not alive, '关窗口没退出'
         except tk.TclError as exc:
             print(f'  跳过界面检查（无图形环境：{exc}）')
             return
         finally:
             if app is not None:
-                app.destroy()
+                try:
+                    app.destroy()     # 上面「退出程序」那条已经销毁过一次了
+                except tk.TclError:
+                    pass
             deploy.CONFIG_DIR, deploy.CONFIG_FILE = saved
-    print('✅ 界面构造与部署后动作字段显隐')
+    print('✅ 界面构造 / 部署后动作字段显隐 / 关闭窗口行为')
 
 
 def main():
@@ -455,6 +500,7 @@ def main():
     check_site_and_java_parsing()
     check_multi_panel()
     check_config_io()
+    check_close_action()
     check_gui_constructs()
     print('\n全部自检通过。')
 

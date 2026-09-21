@@ -25,11 +25,21 @@ RESTART_CHOICES = [
 ]
 RESTART_LABELS = dict(RESTART_CHOICES)
 
+# 点关闭按钮时的行为：(值, 界面显示文本)。ask = 还没定过，关窗口时问一次
+CLOSE_CHOICES = [
+    ('ask', '每次询问'),
+    ('exit', '退出程序'),
+    ('tray', '最小化到托盘'),
+]
+CLOSE_LABELS = dict(CLOSE_CHOICES)
+CLOSE_ASK = 'ask'
+
 DEFAULT_PANEL_NAME = '默认面板'
 
 DEFAULT_CONFIG = {
     'version': 2,
     'active_panel': 0,
+    'close_action': CLOSE_ASK,
     'panels': [],
 }
 
@@ -95,7 +105,12 @@ def _migrate_config(data) -> dict:
     if not isinstance(active, int) or not 0 <= active < len(panels):
         active = 0
 
-    return {'version': 2, 'active_panel': active, 'panels': panels}
+    action = data.get('close_action')
+    if not isinstance(action, str) or action not in CLOSE_LABELS:
+        action = CLOSE_ASK      # 老配置没这个字段，坏值也一并盖掉
+
+    return {'version': 2, 'active_panel': active, 'close_action': action,
+            'panels': panels}
 
 
 def load_config() -> dict:
