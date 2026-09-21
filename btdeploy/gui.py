@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import queue
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -18,6 +19,14 @@ from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, NEW_TARGET,
                      target_sources)
 from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
+
+
+def app_icon_path() -> Path:
+    """界面图标：打包后在解包目录（build.py 用 --add-data 带进去），源码运行就看仓库里的。"""
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        return Path(base) / 'assets' / 'icon.png'
+    return Path(__file__).resolve().parent.parent / 'assets' / 'icon.png'
 
 
 def center_on(master, window):
@@ -345,6 +354,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
+        # 标题栏 / 任务栏 / Alt-Tab 的图标：不给的话 Windows 显示 python 或 Tk 的默认图标
+        self._icon_image = None   # 得留引用，PhotoImage 被回收图标就没了
+        icon = app_icon_path()
+        if icon.exists():
+            # 1024×1024 原图对图标太浪费，缩到 256 再交给 Tk（Tk 自己再按系统尺寸取）
+            self._icon_image = tk.PhotoImage(file=str(icon)).subsample(4)
+            self.iconphoto(True, self._icon_image)
         self.geometry('920x680')
         self.minsize(760, 520)
 
@@ -973,7 +989,7 @@ class App(tk.Tk):
                 self.after(120, self._drain_tray)
                 self._log('已缩到右下角通知区：双击图标恢复窗口，右键可以退出')
             else:
-                self._log('这个系统不支持通知区图标，改为最小化到任务栏')
+                self._log(f'通知区图标没起来（{icon.error}），改为最小化到任务栏')
         if self._tray is not None:
             self.withdraw()
         else:

@@ -156,7 +156,7 @@ python build.py
 
 产物自带图标和版本信息：
 
-- **图标**：来自 `assets/icon.svg`，导出成 `assets/icon.png` 后由 PyInstaller 转成 Windows 的 `.ico` / macOS 的 `.icns`，通知区托盘图标也用同一个（打包运行时直接读 exe 自己的图标资源）。
+- **图标**：来自 `assets/icon.svg`，导出成 `assets/icon.png` 后由 PyInstaller 转成 Windows 的 `.ico` / macOS 的 `.icns`。这张 PNG 同时被 `--add-data` 打进包里，界面启动时用它当窗口图标（标题栏 / 任务栏 / Alt-Tab），通知区托盘图标直接读 exe 自己的图标资源 —— 源码直接跑也有正确图标，不再是 python 的默认图标。
 - **署名与版本号**：取自 `btdeploy/__init__.py` 的 `__author__` / `__version__`，写进 Windows exe 的版本资源 —— 右键「属性 → 详细信息」能看到公司、文件版本、版权；macOS 的 bundle id 也是由 `__author__` 拼出来的。
 
 改过 `assets/icon.svg` 之后要重新导出 PNG 再打包（PyInstaller 只认位图）：
@@ -236,7 +236,8 @@ API 密钥以明文存在里面（保存时会尝试设成 `600` 权限，Window
 - 面板 API 没有执行任意 shell 命令的能力，所有动作都受限于面板已有的接口。
 - zip 一次性读进内存后上传，几百 MB 以内没问题，再大需要改成分片上传。
 - Java 项目重启接口是**异步**的，返回「操作已执行」只代表指令已下发，不代表进程已经起来。
-- 缩到通知区的图标用的是 Windows 默认图标；**explorer.exe 重启**（崩溃恢复或「结束任务」）会让图标从通知区消失，重新打开程序即可。
+- 通知区图标复用 exe 自己的图标资源；**explorer.exe 重启**（崩溃恢复或「结束任务」）会让图标从通知区消失，重新打开程序即可。
+- Windows 会按路径缓存 exe 图标：覆盖安装新版本后，任务栏 / 开始菜单 / 资源管理器里可能还是旧图标（旧版本显示的是 python 默认图标）。注销一次或执行 `ie4uinit.exe -show` 刷新缓存。
 - 宝塔官方声明 API 接口可能随面板版本变化，不保证长期稳定。本项目的接口依据 [docs.bt.cn/api](https://docs.bt.cn/api)（面板 v11.7.0）。
 
 ## 接口对照

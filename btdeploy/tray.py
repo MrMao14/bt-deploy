@@ -176,6 +176,7 @@ class TrayIcon:
         self._data = None
         self._proc = None      # 回调必须留着引用，被 GC 掉就是进程崩溃
         self._ok = False
+        self.error: Exception | None = None   # 起不来时留着原因，省得只看到一句「不支持」
 
     def start(self) -> bool:
         """启动托盘线程并等它就位。建不出来（没权限/非 Windows）返回 False。"""
@@ -199,7 +200,8 @@ class TrayIcon:
     def _run(self):
         try:
             self._create()
-        except Exception:
+        except Exception as exc:
+            self.error = exc
             self._ready.set()
             return
         self._ok = True
@@ -228,6 +230,7 @@ class TrayIcon:
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._proc
         wc.hInstance = instance
+        wc.lpszClassName = TRAY_CLASS   # 固定类名：wake_existing 靠它 FindWindow
         if not _user32.RegisterClassW(ctypes.byref(wc)):
             raise OSError('注册托盘窗口类失败')
 

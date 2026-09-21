@@ -273,6 +273,21 @@ def check_single_instance():
     print('✅ 单实例互斥体 / 唤醒已有窗口')
 
 
+def check_tray_icon():
+    """托盘曾经整条线是死的：窗口类漏了类名，注册必然失败，界面只看到「不支持」。
+
+    没 explorer 的机器（CI）到挂图标那步才会失败，窗口那步过了就算数。"""
+    if not tray.AVAILABLE:
+        print('  跳过托盘检查（非 Windows）')
+        return
+    icon = tray.TrayIcon('自检')
+    if icon.start():
+        icon.stop()
+    else:
+        assert '添加托盘图标失败' in str(icon.error), f'托盘窗口没建起来：{icon.error}'
+    print('✅ 托盘窗口类 / 通知区图标')
+
+
 def check_version_compare():
     """版本号比较：v 前缀、位数不齐、两位数都不能判错。"""
     assert update.parse_version('v1.2.3') == (1, 2, 3)
@@ -528,6 +543,7 @@ def main():
     check_config_io()
     check_close_action()
     check_single_instance()
+    check_tray_icon()
     check_version_compare()
     check_gui_constructs()
     print('\n全部自检通过。')

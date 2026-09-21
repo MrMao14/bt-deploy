@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,8 @@ def main() -> int:
         '--windowed',
         '--name', NAME,
         '--icon', str(ICON),
+        # 同一张图也带进包里：界面用它当窗口图标（gui.app_icon_path 从解包目录读）
+        '--add-data', f'{ICON}{os.pathsep}assets',
     ]
     if sys.platform == 'win32':
         args += ['--version-file', str(write_version_file())]

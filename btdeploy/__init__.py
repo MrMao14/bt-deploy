@@ -1,4 +1,4 @@
 """宝塔部署助手：本地打包 → 上传 → 解压 → 重启，全程走宝塔面板 API。"""
 
-__version__ = '1.0.0'
-__author__ = 'lixinke'
+__version__ = '1.0.3'
+__author__ = 'MrMao14'
