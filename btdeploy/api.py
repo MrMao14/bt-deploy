@@ -188,14 +188,18 @@ class BtClient:
         """name: nginx/httpd/mysqld/redis/tomcat/webserver... op: start/stop/restart/reload"""
         return self.post_form('/system', {'action': 'ServiceAdmin', 'name': name, 'type': op})
 
-    def restart_java_project(self, project_name: str) -> dict:
-        """文档标注 GET；先按 GET 调，失败再退回 POST（部分面板版本只收 form）。"""
-        path = '/mod/java/project/restart_project/stype'
+    def java_project_action(self, project_name: str, op: str = 'restart') -> dict:
+        """启停 Java 项目。op: start/stop/restart，文档标注 GET，部分面板版本只收 POST。"""
+        path = f'/mod/java/project/{op}_project/stype'
         params = {'project_name': project_name}
         try:
             return self.get(path, params)
         except BtApiError:
             return self.post_form(path, params)
+
+    def config_info(self) -> dict:
+        """GetConcifInfo：各组件的版本与运行状态，界面上的状态灯就是从这里来的。"""
+        return self.post_form('/system', {'action': 'GetConcifInfo'})
 
     def list_sites(self) -> list[dict]:
         """面板上的网站：每项 {'name': 域名, 'path': 网站根目录}。"""
@@ -222,16 +226,16 @@ class BtClient:
             data = self.post_form(endpoint, {})
         rows = _as_rows(data)
 
-        found: dict[str, str] = {}
+        found: dict[str, dict] = {}
         for row in rows or []:
             if isinstance(row, dict):
                 name = row.get('name') or row.get('project_name')
                 if name:
-                    found[str(name)] = _pick_java_path(row)
+                    found[str(name)] = {'path': _pick_java_path(row), 'status': row.get('status')}
             elif isinstance(row, str):
-                # 有的面板版本按 "name;size;..." 这种分号串返回
-                found.setdefault(row.split(';')[0], '')
-        return [{'name': name, 'path': found[name]} for name in sorted(found)]
+                # 有的面板版本按 "name;size;..." 这种分号串返回，状态没法从字符串里认
+                found.setdefault(row.split(';')[0], {'path': '', 'status': None})
+        return [{'name': name, **found[name]} for name in sorted(found)]
 
     def raw_panel_snapshot(self) -> dict:
         """诊断用：原样拿回两个列表接口的响应，好确认字段名到底叫什么。"""

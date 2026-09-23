@@ -13,12 +13,27 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__, update
 from .api import BtApiError, BtClient
-from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, NEW_TARGET,
-                     RESTART_CHOICES, RESTART_LABELS, deploy, export_targets,
-                     load_config, merge_targets, new_panel, save_config,
+from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, LIGHT_UNKNOWN, NEW_TARGET,
+                     RESTART_CHOICES, RESTART_LABELS, collect_service_status, deploy,
+                     export_targets, load_config, merge_targets, new_panel, save_config,
                      target_sources)
 from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
+
+# 部署目标列表的列。状态列是红黄绿灯，操作列点了弹「启动/停止/重启」菜单
+TARGET_COLUMNS = (
+    ('pick', '', 34),
+    ('name', '名称', 150),
+    ('remote', '远程目录', 210),
+    ('restart', '部署后动作', 130),
+    ('status', '服务状态', 90),
+    ('ops', '操作', 80),
+)
+TARGET_KEYS = tuple(key for key, _text, _width in TARGET_COLUMNS)
+STATUS_COLUMN = TARGET_KEYS.index('status')
+OPS_COLUMN = TARGET_KEYS.index('ops')
+OPERATIONS = (('start', '启动'), ('stop', '停止'), ('restart', '重启'))
+OP_LABELS = dict(OPERATIONS)
 
 
 def app_icon_path() -> Path:
@@ -378,6 +393,10 @@ class App(tk.Tk):
         self._busy = False
         self._picked: set[int] = set()
         self._tray: TrayIcon | None = None
+        # 服务状态灯：下标 → (灯, 文字)，后台线程写 _status_payload，主线程轮询取走
+        self._status: dict[int, tuple[str, str]] = {}
+        self._status_payload: dict | None = None
+        self._status_busy = False
 
         self._build_panel()
         self._build_targets()
@@ -434,11 +453,11 @@ class App(tk.Tk):
         box.pack(fill='both', expand=True, padx=PAD * 2, pady=(PAD * 2, 0))
 
         # 第一列是手写的勾选标记 —— Treeview 没有原生复选框
-        columns = ('pick', 'name', 'source', 'remote', 'restart')
+        columns = [key for key, _text, _width in TARGET_COLUMNS]
         self.tree = ttk.Treeview(box, columns=columns, show='headings', height=7)
-        for key, text, width in (('pick', '', 34), ('name', '名称', 150),
-                                 ('source', '本地目录', 240), ('remote', '远程目录', 210),
-                                 ('restart', '部署后动作', 130)):
+        # 状态列是 emoji 圆点，行高留宽一点免得被裁掉
+        ttk.Style().configure('Treeview', rowheight=24)
+        for key, text, width in TARGET_COLUMNS:
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, stretch=key != 'pick',
                              anchor='center' if key == 'pick' else 'w')
@@ -457,6 +476,8 @@ class App(tk.Tk):
         ttk.Button(actions, text='新增', command=self._add_target).pack(side='left')
         ttk.Button(actions, text='编辑', command=self._edit_target).pack(side='left', padx=(PAD, 0))
         ttk.Button(actions, text='删除', command=self._remove_target).pack(side='left', padx=(PAD, 0))
+        ttk.Button(actions, text='刷新状态', command=self._refresh_status).pack(
+            side='left', padx=(PAD, 0))
         ttk.Button(actions, text='↑ 上移', command=lambda: self._move_target(-1)).pack(
             side='left', padx=(PAD * 3, 0))
         ttk.Button(actions, text='↓ 下移', command=lambda: self._move_target(1)).pack(
@@ -621,28 +642,121 @@ class App(tk.Tk):
             restart = target.get('restart') or {}
             label = RESTART_LABELS.get(restart.get('type', 'none'), restart.get('type', ''))
             extra = restart.get('project_name') or restart.get('service_name')
-            sources = target_sources(target)
-            if len(sources) > 1:
-                shown = f'{sources[0]} 等 {len(sources)} 项'
-            else:
-                shown = sources[0] if sources else ''
             mark = '☑' if index in self._picked else '☐'
             self.tree.insert('', 'end', iid=str(index), values=(
-                mark, target.get('name', ''), shown,
-                target.get('remote_dir', ''), f'{label}{"：" + extra if extra else ""}'))
+                mark, target.get('name', ''), target.get('remote_dir', ''),
+                f'{label}{"：" + extra if extra else ""}',
+                f'{LIGHT_UNKNOWN} 未知', '操作 ▾'))
+        self._refresh_status()
 
     def _on_tree_click(self, event):
-        """点第一列切换勾选。只有点在这一列上才处理，其余交给默认行为。"""
+        """点第一列切换勾选，点操作列弹启停菜单。其余列交给默认行为。"""
         if self.tree.identify('region', event.x, event.y) != 'cell':
-            return None
-        if self.tree.identify_column(event.x) != '#1':
             return None
         iid = self.tree.identify_row(event.y)
         if not iid:
             return None
-        self._picked.symmetric_difference_update({int(iid)})
-        self._refresh_tree()
-        return 'break'
+        column = self.tree.identify_column(event.x)
+        if column == '#1':
+            self._picked.symmetric_difference_update({int(iid)})
+            self._refresh_tree()
+            return 'break'
+        if column == f'#{OPS_COLUMN + 1}':
+            self.tree.selection_set(iid)
+            self._popup_actions(int(iid), event.x_root, event.y_root)
+            return 'break'
+        return None
+
+    def _popup_actions(self, index, x, y):
+        """操作列：列出可用的启停动作，点了才动真格的。"""
+        menu = tk.Menu(self, tearoff=0)
+        for op, label in OPERATIONS:
+            menu.add_command(label=label,
+                             command=lambda op=op: self._service_action(index, op))
+        menu.tk_popup(x, y)
+        menu.grab_release()
+
+    def _service_action(self, index, op):
+        """启停/重启一个目标对应的服务。Java 走项目接口，其余走 ServiceAdmin。"""
+        targets = self._targets()
+        if not 0 <= index < len(targets):
+            return
+        restart = targets[index].get('restart') or {}
+        kind = restart.get('type') or 'none'
+        if kind == 'java_restart':
+            name = (restart.get('project_name') or '').strip()
+            if not name:
+                messagebox.showinfo('提示', '这个目标没配置 Java 项目名')
+                return
+        else:
+            # 静态目标没填服务名就用 webserver —— 面板自己认 Nginx/Apache
+            name = (restart.get('service_name') or '').strip() or 'webserver'
+
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+
+        if kind == 'java_restart':
+            title = f'{OP_LABELS[op]} Java 项目「{name}」'
+            work = lambda: client.java_project_action(name, op)
+        else:
+            title = f'{OP_LABELS[op]}服务 {name}'
+            work = lambda: client.service_admin(name, op)
+        self._run_async(title, work)
+
+    # ------------------------------------------------------------- 服务状态
+
+    def _refresh_status(self):
+        """后台拉一次状态灯。拉不回来就保持「未知」，不拿旧数据硬撑。"""
+        if self._status_busy:
+            return
+        targets = self._targets()
+        if not targets:
+            self._status = {}
+            self._apply_status()
+            return
+        try:
+            client = self._client()
+        except BtApiError:
+            return
+
+        self._status_busy = True
+        self._status = {}
+        self._apply_status()      # 下标可能刚变过，先一律刷成未知
+        self._status_payload = None
+
+        def worker():
+            try:
+                self._status_payload = collect_service_status(client, targets)
+            except Exception:      # 状态灯不值得把界面拖垮
+                self._status_payload = {}
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(150, self._poll_status)
+
+    def _poll_status(self):
+        """线程只写结果，取结果和画界面都留在这个线程 —— Tkinter 不是线程安全的。"""
+        if not self.winfo_exists():
+            return
+        if self._status_payload is None:
+            self.after(150, self._poll_status)
+            return
+        self._status = self._status_payload
+        self._status_payload, self._status_busy = None, False
+        self._apply_status()
+
+    def _apply_status(self, mapping=None):
+        """把状态灯写进状态列。没有对应数据的行一律黄灯。"""
+        mapping = self._status if mapping is None else mapping
+        for iid in self.tree.get_children():
+            values = list(self.tree.item(iid, 'values'))
+            if len(values) <= STATUS_COLUMN:
+                continue
+            dot, text = mapping.get(int(iid), (LIGHT_UNKNOWN, '未知'))
+            values[STATUS_COLUMN] = f'{dot} {text}'
+            self.tree.item(iid, values=values)
 
     def _selected_index(self) -> int | None:
         selection = self.tree.selection()
@@ -796,6 +910,7 @@ class App(tk.Tk):
     def _finish_task(self, result, on_done):
         """线程收尾：先解除忙状态再交回结果，on_done 里就能接着发起下一个任务。"""
         self._set_busy(False)
+        self._refresh_status()   # 能跑到这的任务多半动过服务，顺手把状态灯刷一下
         if on_done is not None and result is not None:
             on_done(result)
 

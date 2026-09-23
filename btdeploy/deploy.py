@@ -256,11 +256,91 @@ def restart_service(client: BtClient, cfg: dict, log) -> None:
         project = (cfg.get('project_name') or '').strip()
         if not project:
             raise BtApiError('重启方式为「重启 Java 项目」时必须填写项目名称')
-        client.restart_java_project(project)
+        client.java_project_action(project, 'restart')
         # 面板接口是异步的，只保证"操作已执行"
         log(f'      已下发重启指令：{project}')
     else:
         raise BtApiError(f'未知的重启方式：{kind}')
+
+
+# ------------------------------------------------------------------ 服务状态
+
+# GetConcifInfo 里各组件的 key：面板上重启哪个服务，就查哪个组件的状态
+SERVICE_STATUS_KEYS = {
+    'nginx': 'web', 'httpd': 'web', 'apache': 'web', 'webserver': 'web',
+    'openlitespeed': 'web',
+    'mysqld': 'mysql', 'mysql': 'mysql', 'mariadb': 'mysql',
+    'redis': 'redis', 'memcached': 'memcached', 'pure-ftpd': 'pure-ftpd',
+    'tomcat': 'tomcat',
+}
+
+LIGHT_ON, LIGHT_OFF, LIGHT_UNKNOWN = '🟢', '🔴', '🟡'
+
+
+def _is_running(value) -> bool | None:
+    """面板的 status 字段有 bool / 0-1 / 字符串三种写法，认不出来就返回 None。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('1', 'true', 'on', 'running', 'start', 'started'):
+            return True
+        if text in ('0', 'false', 'off', 'stopped', 'stop', 'notrunning'):
+            return False
+    return None
+
+
+def _status_cell(value) -> tuple[str, str]:
+    """状态值 → (灯, 文字)。认不出来算「未知」—— 黄灯既不是绿灯也不是红灯。"""
+    if value is None:
+        return LIGHT_UNKNOWN, '未知'
+    return (LIGHT_ON, '运行中') if value else (LIGHT_OFF, '已停止')
+
+
+def collect_service_status(client: BtClient, targets: list) -> dict[int, tuple[str, str]]:
+    """一次把列表要的状态全拉回来：Java 项目查 project_list，其余查 GetConcifInfo。
+
+    每行只认一个来源：java_restart 看项目本身，静态/系统服务看对应的组件。
+    拉不到（没装插件、密钥没权限、面板版本太老）一律「未知」—— 宁可黄灯不可点错。
+    """
+    restarts = [(target.get('restart') or {}) for target in targets]
+    kinds = [(item.get('type') or 'none') for item in restarts]
+
+    projects: dict = {}
+    if 'java_restart' in kinds:
+        try:
+            projects = {row['name']: row.get('status') for row in client.list_java_projects()}
+        except BtApiError:
+            projects = {}
+
+    env: dict = {}
+    if any(kind != 'java_restart' for kind in kinds):
+        try:
+            env = client.config_info()
+        except BtApiError:
+            env = {}
+        if not isinstance(env, dict):
+            env = {}
+
+    statuses = {}
+    for index, kind in enumerate(kinds):
+        restart = restarts[index]
+        if kind == 'java_restart':
+            project = (restart.get('project_name') or '').strip()
+            statuses[index] = _status_cell(_is_running(projects.get(project)) if project else None)
+            continue
+
+        key = SERVICE_STATUS_KEYS.get((restart.get('service_name') or '').strip().lower(), 'web') \
+            if kind == 'service_restart' else 'web'
+        entry = env.get(key)
+        if isinstance(entry, dict) and entry.get('setup') is False:
+            statuses[index] = (LIGHT_UNKNOWN, '未安装')
+        else:
+            statuses[index] = _status_cell(
+                _is_running(entry.get('status')) if isinstance(entry, dict) else None)
+    return statuses
 
 
 # ------------------------------------------------------------------ 部署流程

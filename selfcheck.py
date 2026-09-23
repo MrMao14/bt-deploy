@@ -327,11 +327,12 @@ def check_site_and_java_parsing():
     ], client.list_sites()
 
     client.get = lambda path, params=None: {
-        'data': [{'name': 'demo', 'project_jar': '/opt/demo/app.jar'}, {'name': 'plain'}],
+        'data': [{'name': 'demo', 'project_jar': '/opt/demo/app.jar', 'status': True},
+                 {'name': 'plain'}],
     }
     assert client.list_java_projects() == [
-        {'name': 'demo', 'path': '/opt/demo'},
-        {'name': 'plain', 'path': ''},
+        {'name': 'demo', 'path': '/opt/demo', 'status': True},
+        {'name': 'plain', 'path': '', 'status': None},
     ], client.list_java_projects()
     print('✅ 网站 / Java 项目列表字段解析')
 
@@ -342,8 +343,8 @@ def check_restart_dispatch():
         def service_admin(self, name, op):
             calls.append(('service', name, op))
 
-        def restart_java_project(self, project):
-            calls.append(('java', project))
+        def java_project_action(self, project, op='restart'):
+            calls.append(('java', project, op))
 
     def run(cfg):
         calls.clear()
@@ -354,7 +355,8 @@ def check_restart_dispatch():
     assert run({'type': 'webserver_reload'}) == [('service', 'webserver', 'reload')]
     assert run({'type': 'service_restart', 'service_name': 'nginx'}) == \
         [('service', 'nginx', 'restart')]
-    assert run({'type': 'java_restart', 'project_name': 'demo'}) == [('java', 'demo')]
+    assert run({'type': 'java_restart', 'project_name': 'demo'}) == \
+        [('java', 'demo', 'restart')]
     assert run({}) == []
 
     for bad in ({'type': 'java_restart'}, {'type': 'service_restart'}, {'type': 'nope'}):
@@ -364,6 +366,74 @@ def check_restart_dispatch():
             continue
         raise AssertionError(f'{bad} 应该报错')
     print('✅ 重启动作分发与缺参校验')
+
+
+def check_java_actions():
+    """启停走同一套路由；面板只收 form 时要能退回 POST。"""
+    client = BtClient('http://127.0.0.1:8888', 'KEY')
+    seen = []
+
+    def fake_get(path, params=None):
+        seen.append(('GET', path))
+        raise BtApiError('这个面板版本只认 POST')
+
+    client.get = fake_get
+    client.post_form = lambda path, params: seen.append(('POST', path)) or {'status': True}
+
+    for op in ('start', 'stop', 'restart'):
+        client.java_project_action('demo', op)
+
+    expected = []
+    for op in ('start', 'stop', 'restart'):
+        expected += [('GET', f'/mod/java/project/{op}_project/stype'),
+                     ('POST', f'/mod/java/project/{op}_project/stype')]
+    assert seen == expected, seen
+    print('✅ Java 项目启停路由与 POST 回退')
+
+
+def check_service_status():
+    """状态灯：Java 目标看项目状态，其余看组件状态，认不出来一律黄灯。"""
+    from btdeploy.deploy import (LIGHT_OFF, LIGHT_ON, LIGHT_UNKNOWN,
+                                 collect_service_status)
+
+    class FakeClient:
+        def list_java_projects(self):
+            return [{'name': 'demo', 'path': '/opt/demo', 'status': True},
+                    {'name': 'dead', 'path': '/opt/dead', 'status': '0'}]
+
+        def config_info(self):
+            return {'web': {'type': 'nginx', 'setup': True, 'status': True},
+                    'mysql': {'setup': True, 'status': False},
+                    'redis': {'setup': False, 'status': False}}
+
+    targets = [
+        {'restart': {'type': 'java_restart', 'project_name': 'demo'}},
+        {'restart': {'type': 'java_restart', 'project_name': 'dead'}},
+        {'restart': {'type': 'java_restart', 'project_name': 'missing'}},
+        {'restart': {'type': 'none'}},
+        {'restart': {'type': 'webserver_reload'}},
+        {'restart': {'type': 'service_restart', 'service_name': 'mysqld'}},
+        {'restart': {'type': 'service_restart', 'service_name': 'redis'}},
+    ]
+    statuses = collect_service_status(FakeClient(), targets)
+    assert statuses[0] == (LIGHT_ON, '运行中'), statuses
+    assert statuses[1] == (LIGHT_OFF, '已停止'), '字符串 "0" 也要认成已停止'
+    assert statuses[2] == (LIGHT_UNKNOWN, '未知'), '查不到的项目不能点绿灯'
+    assert statuses[3] == (LIGHT_ON, '运行中'), '静态目标看 Nginx（web 组件）'
+    assert statuses[4] == (LIGHT_ON, '运行中'), statuses
+    assert statuses[5] == (LIGHT_OFF, '已停止'), 'mysqld 要落到 mysql 上'
+    assert statuses[6] == (LIGHT_UNKNOWN, '未安装'), 'setup=false 不算运行中'
+
+    class DeadClient:
+        def list_java_projects(self):
+            raise BtApiError('没有权限')
+
+        def config_info(self):
+            raise BtApiError('没有权限')
+
+    assert set(collect_service_status(DeadClient(), targets).values()) == \
+        {(LIGHT_UNKNOWN, '未知')}, '接口挂了必须全是黄灯'
+    print('✅ 服务状态灯：Java 项目 / 组件状态 / 认不出来一律黄灯')
 
 
 def check_gui_constructs():
@@ -553,6 +623,8 @@ def main():
     check_zip()
     check_target_sources()
     check_restart_dispatch()
+    check_java_actions()
+    check_service_status()
     check_java_path_pick()
     check_site_and_java_parsing()
     check_multi_panel()
