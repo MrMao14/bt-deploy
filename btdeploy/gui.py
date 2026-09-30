@@ -17,8 +17,8 @@ from . import __version__, update
 from .api import BtApiError, BtClient
 from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, LIGHT_UNKNOWN, NEW_TARGET,
                      RESTART_CHOICES, RESTART_LABELS, collect_service_status, deploy,
-                     export_targets, load_config, merge_targets, new_panel, save_config,
-                     target_sources)
+                     export_targets, load_config, merge_targets, new_panel,
+                     parse_targets_payload, save_config, target_sources)
 from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
 
@@ -1151,13 +1151,8 @@ class App(tk.Tk):
             messagebox.showerror('导入失败', f'读不了这个文件：{exc}')
             return
 
-        if isinstance(payload, list):
-            incoming, meta = payload, {}
-        elif isinstance(payload, dict):
-            incoming, meta = payload.get('targets'), payload
-        else:
-            incoming, meta = None, {}
-
+        # 认目标导出文件、裸数组，也认本程序自己的 config.json（v1 顶层 / v2 在 panels 里）
+        incoming, meta = parse_targets_payload(payload)
         if not isinstance(incoming, list):
             messagebox.showerror('导入失败', '文件里没有 targets 数组')
             return

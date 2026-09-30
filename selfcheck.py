@@ -18,7 +18,7 @@ from pathlib import Path
 
 from btdeploy.api import BtApiError, BtClient
 from btdeploy.deploy import (CLOSE_LABELS, RESTART_LABELS, _migrate_config, build_zip,
-                             export_targets, merge_targets, new_panel,
+                             export_targets, merge_targets, new_panel, parse_targets_payload,
                              restart_service, target_sources)
 from btdeploy import tray, update
 
@@ -247,7 +247,19 @@ def check_config_io():
     original = [{'name': 'a', 'remote_dir': '/old'}]
     merge_targets(original, [{'name': 'a', 'remote_dir': '/new'}])
     assert original[0]['remote_dir'] == '/old', 'merge 改动了入参'
-    print('✅ 导出不含密钥 / 导入按名称合并')
+
+    # 导入还认本程序自己的配置文件：v1 顶层 targets，v2 收在 panels 里
+    incoming, meta = parse_targets_payload(
+        {'version': 2, 'panels': [{'targets': [{'name': 'p'}]}, {'name': 'q'}]})
+    assert [t['name'] for t in incoming] == ['p'], incoming
+    incoming, _meta = parse_targets_payload({'panel_url': 'x', 'targets': [{'name': 'v1'}]})
+    assert [t['name'] for t in incoming] == ['v1'], incoming
+    incoming, _meta = parse_targets_payload([{'name': 'bare'}])
+    assert [t['name'] for t in incoming] == ['bare'], incoming
+    for junk in ({}, {'version': 2}, {'targets': []}, {'panels': []},
+                 {'panels': 'junk'}, 'junk', 42, None):
+        assert parse_targets_payload(junk)[0] is None, junk
+    print('✅ 导出不含密钥 / 导入按名称合并 / 认配置文件')
 
 
 def check_close_action():

@@ -169,6 +169,24 @@ def merge_targets(existing: list, incoming: list) -> tuple[list, int, int]:
             replaced += 1
     return merged, added, replaced
 
+def parse_targets_payload(payload):
+    """从导入的 JSON 里抠出目标列表，返回 (目标列表, 元信息)。
+
+    认三种：目标导出文件（顶层 targets）、裸数组、本程序自己的配置文件
+    （v1 顶层 targets，v2 在 panels 里）。认不出来返回 (None, {})。"""
+    if isinstance(payload, list):
+        return payload, {}
+    if isinstance(payload, dict):
+        incoming = payload.get('targets')
+        if not isinstance(incoming, list):
+            panels = payload.get('panels')
+            incoming = ([t for p in panels if isinstance(p, dict)
+                         for t in (p.get('targets') or []) if isinstance(t, dict)]
+                        if isinstance(panels, list) else None)
+        return (incoming or None), payload   # 空列表也算没东西可导
+    return None, {}
+
+
 
 # ------------------------------------------------------------------ 本地打包
 
