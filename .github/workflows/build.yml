@@ -23,11 +23,11 @@ jobs:
       - name: 装打包工具
         run: pip install -r requirements.txt
 
-#      - name: 自检
-#        run: python selfcheck.py
-#        env:
-#          # macOS runner 没有桌面会话，Tk 会卡在等窗口可见；逻辑部分照常跑
-#          BTDEPLOY_SKIP_GUI: ${{ runner.os == 'macOS' && '1' || '' }}
+      - name: 自检
+        run: python selfcheck.py
+        env:
+          # macOS runner 没有桌面会话，Tk 会卡在等窗口可见；逻辑部分照常跑
+          BTDEPLOY_SKIP_GUI: ${{ runner.os == 'macOS' && '1' || '' }}
       - name: 打包
         run: python build.py
 
