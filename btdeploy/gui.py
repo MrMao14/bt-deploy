@@ -11,7 +11,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 from . import __version__, update
 from .api import BtApiError, BtClient
@@ -432,6 +432,8 @@ class LogViewer(tk.Toplevel):
         ttk.Button(bar, text='刷新列表',
                    command=self.refresh_files).pack(side='left', padx=(PAD, 0))
         ttk.Checkbutton(bar, text='自动刷新', variable=self._auto).pack(side='left', padx=(PAD, 0))
+        ttk.Button(bar, text='A−', width=3, command=lambda: self._zoom(-1)).pack(side='left', padx=(PAD, 0))
+        ttk.Button(bar, text='A+', width=3, command=lambda: self._zoom(1)).pack(side='left', padx=(4, 0))
 
         # 搜索：实时高亮全部命中，回车跳下一个、Shift+回车上一个，Ctrl+F 聚焦输入框
         self._hits: list[tuple[str, str]] = []
@@ -451,7 +453,8 @@ class LogViewer(tk.Toplevel):
         box.pack(fill='both', expand=True, padx=PAD, pady=(0, PAD))
         box.rowconfigure(0, weight=1)
         box.columnconfigure(0, weight=1)
-        self.txt = tk.Text(box, wrap='none', font=('Courier New', 10),
+        self._font = tkfont.Font(family='Courier New', size=10)   # 共享对象：改 size 整个 Text 跟着变
+        self.txt = tk.Text(box, wrap='none', font=self._font,
                            background='#1c1c1c', foreground='#dcdcdc',
                            insertbackground='#dcdcdc')
         for tag, _pattern, color in self.STYLES:
@@ -475,6 +478,10 @@ class LogViewer(tk.Toplevel):
         center_on(master, self)
         self.bind('<Control-f>', lambda _e: (self.entry_search.focus_set(),
                                              self.entry_search.select_range(0, 'end')))
+        self.bind('<Control-plus>', lambda _e: self._zoom(1))
+        self.bind('<Control-equal>', lambda _e: self._zoom(1))
+        self.bind('<Control-minus>', lambda _e: self._zoom(-1))
+        self.bind('<Control-Key-0>', lambda _e: self._zoom(0))
 
     # ------------------------------------------------------------- 数据
 
@@ -614,6 +621,11 @@ class LogViewer(tk.Toplevel):
 
     def _set_status(self, text: str, error: bool = False):
         self.status.configure(text=text, foreground='#f14c4c' if error else '#666')
+
+    def _zoom(self, step: int):
+        """调字号：step ±1 或 0 = 回到默认。范围 7–28，改共享 Font 对象即可。"""
+        size = self._font['size'] if step else 10
+        self._font['size'] = max(7, min(28, size + step))
 
     @staticmethod
     def _fmt_size(size: int) -> str:
