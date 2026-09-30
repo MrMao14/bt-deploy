@@ -197,6 +197,36 @@ class BtClient:
         except BtApiError:
             return self.post_form(path, params)
 
+    def list_dir(self, path: str) -> list[dict]:
+        """GetDir：目录下的文件列表，每项含 filename/size/mtime。只关心文件，目录不给。
+
+        有的面板版本 FILES 给对象数组，有的给 '文件名;大小;mtime;…' 分号串，两种都接。
+        """
+        data = self.post_form('/files', {'action': 'GetDir', 'path': path})
+        if not isinstance(data, dict):
+            return []
+        files = []
+        for row in _as_rows(data.get('FILES')):
+            if isinstance(row, dict):
+                name = str(row.get('filename') or '')
+                size = int(row.get('size') or 0)
+                mtime = row.get('mtime') or 0
+            else:
+                parts = str(row).split(';')
+                name = parts[0]
+                size = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                mtime = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            if name:
+                files.append({'filename': name, 'size': size, 'mtime': mtime})
+        return files
+
+    def read_file(self, path: str) -> str:
+        """GetFileBody：读整个文本文件。面板对大文件会拒绝，调用方先看列表里的 size。"""
+        data = self.post_form('/files', {'action': 'GetFileBody', 'path': path})
+        if isinstance(data, dict):
+            return str(data.get('DATA') or data.get('data') or '')
+        return str(data)
+
     def config_info(self) -> dict:
         """GetConcifInfo：各组件的版本与运行状态，界面上的状态灯就是从这里来的。"""
         return self.post_form('/system', {'action': 'GetConcifInfo'})

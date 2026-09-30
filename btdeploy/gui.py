@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import json
 import queue
+import re
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -45,15 +47,18 @@ def app_icon_path() -> Path:
 
 
 def center_on(master, window):
-    """按内容定尺寸并居中到父窗口 —— Tk 默认会把 Toplevel 丢到屏幕左上角。"""
+    """按内容定尺寸并居中到父窗口 —— Tk 默认会把 Toplevel 丢到屏幕左上角。
+
+    macOS 上 map 之前设置的坐标会被系统按级联规则重摆，外接显示器时尤其离谱；
+    所以先定尺寸，等窗口真正 map 出来后再定位一次。另外不做『不许小于 0』的钳制：
+    外接屏在主屏左侧时坐标本来就是负数，一钳就把弹窗甩到另一块屏上去了。"""
     window.update_idletasks()
     width, height = window.winfo_reqwidth(), window.winfo_reqheight()
     x = master.winfo_rootx() + (master.winfo_width() - width) // 2
     y = master.winfo_rooty() + (master.winfo_height() - height) // 2
-    # 别跑到屏幕外面去
-    x = max(0, min(x, window.winfo_screenwidth() - width))
-    y = max(0, min(y, window.winfo_screenheight() - height))
     window.geometry(f'{width}x{height}+{x}+{y}')
+    window.wait_visibility()
+    window.geometry(f'+{x}+{y}')   # map 之后再设一次，macOS 才认这个位置
 
 
 class TargetDialog(tk.Toplevel):
@@ -374,6 +379,243 @@ class CloseChoiceDialog(tk.Toplevel):
         self.result = (action, bool(self.var_remember.get()))
         self.destroy()
 
+class LogViewer(tk.Toplevel):
+    """远端项目日志查看器：列出服务器上 <remote_dir>/logs 的文件，倒序显示、可自动刷新。"""
+
+    QUICK_FILES = ('sys-info.log', 'sys-error.log')
+    REFRESH_MS = 5000
+    # ponytail: GetFileBody 是整文件读，超过 16MB 就不拉了（会把面板拖垮），
+    # 真要看超大文件时再换成下载/分段方案
+    MAX_READ_SIZE = 16 * 1024 * 1024
+
+    # 日志高亮：tag 名 → (正则, 颜色)，每行只标第一处命中
+    STYLES = (
+        ('err', r'\bERROR\b|Exception|Caused by', '#f14c4c'),
+        ('warn', r'\bWARN(?:ING)?\b', '#e5c07b'),
+        ('info', r'\bINFO\b', '#61afef'),
+        ('debug', r'\bDEBUG\b|\bTRACE\b', '#7f8c8d'),
+        ('time', r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}', '#98c379'),
+    )
+
+    def __init__(self, master, client, logs_dir: str):
+        super().__init__(master)
+        self.title(f'项目日志 · {logs_dir}')
+        self.client = client
+        self.logs_dir = logs_dir
+        self.current = ''           # 当前正在看的文件名
+        self._sizes: dict[str, int] = {}
+        # 工作线程只写 _payload，取结果和画界面都在主线程 —— Tkinter 不是线程安全的
+        self._payload = None
+        self._loading = False
+        self._auto = tk.BooleanVar(value=False)
+
+        bar = ttk.Frame(self, padding=PAD)
+        bar.pack(fill='x')
+        self.btn_quick = {}
+        for name in self.QUICK_FILES:
+            btn = ttk.Button(bar, text=name, command=lambda n=name: self.open_file(n))
+            btn.pack(side='left')
+            self.btn_quick[name] = btn
+        self.combo_files = ttk.Combobox(bar, state='readonly', width=30)
+        self.combo_files.pack(side='left', padx=(PAD, 0))
+        self.combo_files.bind('<<ComboboxSelected>>',
+                              lambda _e: self.open_file(self.combo_files.get()))
+        ttk.Button(bar, text='刷新列表',
+                   command=self.refresh_files).pack(side='left', padx=(PAD, 0))
+        ttk.Checkbutton(bar, text='自动刷新', variable=self._auto).pack(side='left', padx=(PAD, 0))
+
+        # 搜索：实时高亮全部命中，回车跳下一个、Shift+回车上一个，Ctrl+F 聚焦输入框
+        self._hits: list[tuple[str, str]] = []
+        self._hit_index = -1
+        self.var_search = tk.StringVar()
+        self.var_search.trace_add('write', lambda *_e: self._highlight_search())
+        self.entry_search = ttk.Entry(bar, textvariable=self.var_search, width=18)
+        self.entry_search.pack(side='left', padx=(PAD, 0))
+        self.entry_search.bind('<Return>', lambda _e: self._find(1))
+        self.entry_search.bind('<Shift-Return>', lambda _e: self._find(-1))
+        ttk.Button(bar, text='查找下一个',
+                   command=lambda: self._find(1)).pack(side='left', padx=(4, 0))
+        self.lbl_hits = ttk.Label(bar, text='')
+        self.lbl_hits.pack(side='left', padx=(4, 0))
+
+        box = ttk.Frame(self)
+        box.pack(fill='both', expand=True, padx=PAD, pady=(0, PAD))
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        self.txt = tk.Text(box, wrap='none', font=('Courier New', 10),
+                           background='#1c1c1c', foreground='#dcdcdc',
+                           insertbackground='#dcdcdc')
+        for tag, _pattern, color in self.STYLES:
+            self.txt.tag_configure(tag, foreground=color)
+        self.txt.tag_configure('search', background='#2a4a6a')
+        self.txt.tag_configure('search_cur', background='#e5c07b', foreground='#1c1c1c')
+        self.txt.tag_raise('search')
+        self.txt.tag_raise('search_cur')
+        scroll = ttk.Scrollbar(box, orient='vertical', command=self.txt.yview)
+        self.txt.configure(yscrollcommand=scroll.set)
+        self.txt.grid(row=0, column=0, sticky='nsew')
+        scroll.grid(row=0, column=1, sticky='ns')
+
+        self.status = ttk.Label(self, text='加载中…', anchor='w', padding=(PAD, 0))
+        self.status.pack(fill='x', side='bottom')
+
+        self.geometry('1100x680')
+        self.refresh_files()
+        self.after(self.REFRESH_MS, self._auto_loop)
+        self.after(150, self._poll)
+        center_on(master, self)
+        self.bind('<Control-f>', lambda _e: (self.entry_search.focus_set(),
+                                             self.entry_search.select_range(0, 'end')))
+
+    # ------------------------------------------------------------- 数据
+
+    def refresh_files(self):
+        self._fetch(self._load_files, '读取文件列表…')
+
+    def open_file(self, name: str):
+        if not name:
+            return
+        self.current = name
+        self.combo_files.set(name)
+        size = self._sizes.get(name)
+        if size is not None and size > self.MAX_READ_SIZE:
+            self._set_status(f'❌ {name} 有 {self._fmt_size(size)}，太大不拉取了，去面板网页上看', error=True)
+            return
+        self._fetch(self._load_content, f'读取 {name} …')
+
+    def _load_files(self):
+        rows = self.client.list_dir(self.logs_dir)
+        rows.sort(key=lambda row: row.get('mtime') or 0, reverse=True)
+        names = [str(row.get('filename') or '') for row in rows if row.get('filename')]
+        sizes = {name: int(row.get('size') or 0) for row, name in zip(rows, names)}
+        return ('files', names, sizes)
+
+    def _load_content(self):
+        return ('content', self.current,
+                self.client.read_file(f'{self.logs_dir.rstrip("/")}/{self.current}'))
+
+    def _fetch(self, work, note: str):
+        """后台跑 work()，结果塞进 _payload 由主线程 _poll 取走。已有请求在跑就跳过。"""
+        if self._loading:
+            return
+        self._loading = True
+        self._set_status(note)
+
+        def worker():
+            try:
+                self._payload = work()
+            except BtApiError as exc:
+                self._payload = ('err', str(exc))
+            except Exception as exc:   # 兜底，别让线程静默死掉
+                self._payload = ('err', f'{type(exc).__name__}: {exc}')
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        payload, self._payload = self._payload, None
+        if payload is not None:
+            self._loading = False
+            self._apply(payload)
+        self.after(150, self._poll)
+
+    def _apply(self, payload):
+        kind = payload[0]
+        if kind == 'err':
+            self._set_status(f'❌ {payload[1]}', error=True)
+            return
+        if kind == 'files':
+            names, self._sizes = payload[1], payload[2]
+            if list(self.combo_files['values']) != names:
+                self.combo_files['values'] = names
+                if self.current and self.current not in names:
+                    self.current = ''
+                    self.combo_files.set('')
+            for quick_name, btn in self.btn_quick.items():
+                btn.state(['!disabled'] if quick_name in names else ['disabled'])
+            if not names:
+                self._set_status(f'❌ 目录里没有日志文件：{self.logs_dir}', error=True)
+                return
+            self._set_status(f'{len(names)} 个文件 · {self.logs_dir}')
+            if not self.current:
+                self.open_file(names[0])   # 默认看最新的一个
+            return
+        name, content = payload[1], payload[2]
+        self._render(content)
+        size = self._sizes.get(name)
+        info = f'{name} · {self._fmt_size(size)}' if size is not None else name
+        self._set_status(f'{info} · 刷新于 {time.strftime("%H:%M:%S")}')
+
+    def _render(self, content: str):
+        self.txt.configure(state='normal')
+        self.txt.delete('1.0', 'end')
+        lines = content.splitlines()
+        lines.reverse()   # 日志是往尾部追加的，倒过来最新在最上面
+        patterns = {tag: re.compile(pattern) for tag, pattern, _color in self.STYLES}
+        for number, line in enumerate(lines, 1):
+            self.txt.insert('end', line + '\n')
+            for tag, regex in patterns.items():
+                match = regex.search(line)
+                if match:
+                    self.txt.tag_add(tag, f'{number}.{match.start()}',
+                                     f'{number}.{match.end()}')
+        self.txt.configure(state='disabled')
+        self.txt.see('1.0')
+        self._highlight_search()
+        self.txt.configure(state='disabled')
+
+    def _highlight_search(self):
+        """把所有命中标蓝，当前命中标黄。输入框每次变化都会重算。"""
+        self.txt.tag_remove('search', '1.0', 'end')
+        self.txt.tag_remove('search_cur', '1.0', 'end')
+        term = self.var_search.get().strip()
+        self._hits = []
+        if term:
+            pos = '1.0'
+            while True:
+                pos = self.txt.search(term, pos, stopindex='end', nocase=True)
+                if not pos:
+                    break
+                end = f'{pos}+{len(term)}c'
+                self._hits.append((pos, end))
+                self.txt.tag_add('search', pos, end)
+                pos = end
+        self._hit_index = -1
+        self.lbl_hits.configure(text=f'{len(self._hits)} 处' if term else '')
+
+    def _find(self, step: int):
+        """跳到下一个/上一个命中，到头就绕回来。"""
+        if not self._hits:
+            return
+        self._hit_index = (self._hit_index + step) % len(self._hits)
+        pos, end = self._hits[self._hit_index]
+        self.txt.tag_remove('search_cur', '1.0', 'end')
+        self.txt.tag_add('search_cur', pos, end)
+        self.txt.see(pos)
+        self.lbl_hits.configure(text=f'{self._hit_index + 1}/{len(self._hits)}')
+
+    def _auto_loop(self):
+        """勾了自动刷新就每隔 REFRESH_MS 重新拉一次当前文件。"""
+        if not self.winfo_exists():
+            return
+        if self._auto.get() and self.current:
+            self.open_file(self.current)
+        self.after(self.REFRESH_MS, self._auto_loop)
+
+    def _set_status(self, text: str, error: bool = False):
+        self.status.configure(text=text, foreground='#f14c4c' if error else '#666')
+
+    @staticmethod
+    def _fmt_size(size: int) -> str:
+        value = float(size)
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if value < 1024 or unit == 'GB':
+                return f'{value:.0f} {unit}' if unit == 'B' else f'{value:.1f} {unit}'
+            value /= 1024
+        return f'{value:.1f} GB'
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -673,8 +915,11 @@ class App(tk.Tk):
         for op, label in OPERATIONS:
             menu.add_command(label=label,
                              command=lambda op=op: self._service_action(index, op))
+        menu.add_separator()
+        menu.add_command(label='查看日志', command=lambda: self._view_log(index))
         menu.tk_popup(x, y)
         menu.grab_release()
+
 
     def _service_action(self, index, op):
         """启停/重启一个目标对应的服务。Java 走项目接口，其余走 ServiceAdmin。"""
@@ -708,6 +953,21 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- 服务状态
 
+    def _view_log(self, index):
+        """操作菜单：打开目标在服务器上的项目日志查看器（<remote_dir>/logs 目录）。"""
+        targets = self._targets()
+        if not 0 <= index < len(targets):
+            return
+        remote_dir = (targets[index].get('remote_dir') or '').strip().rstrip('/')
+        if not remote_dir:
+            messagebox.showinfo('提示', '这个目标没有配置远程目录')
+            return
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+        LogViewer(self, client, f'{remote_dir}/logs')
     def _refresh_status(self):
         """后台拉一次状态灯。拉不回来就保持「未知」，不拿旧数据硬撑。"""
         if self._status_busy:
@@ -829,9 +1089,10 @@ class App(tk.Tk):
             messagebox.showinfo('提示', '还没有可导出的部署目标')
             return
         path = filedialog.asksaveasfilename(
-            title='导出配置', defaultextension='.json',
+            parent=self, title='导出配置', defaultextension='.json',
             initialfile='bt-deploy-targets.json',
-            filetypes=[('JSON 配置', '*.json'), ('所有文件', '*.*')],
+            # mac 上全文件类型必须写 '*'，'*.*' 会导致对话框无法选文件
+            filetypes=[('JSON 配置', '*.json'), ('所有文件', '*')],
         )
         if not path:
             return
@@ -849,8 +1110,18 @@ class App(tk.Tk):
 
     def _import_config(self):
         """导入别人分享的 JSON：同名覆盖，其余追加。"""
-        path = filedialog.askopenfilename(
-            title='导入配置', filetypes=[('JSON 配置', '*.json'), ('所有文件', '*.*')])
+        # macOS 原生文件对话框不认 '*.*'（Windows 习惯写法），全文件类型必须用 '*'，否则无法选文件
+        filetypes = [('JSON 配置', '*.json'), ('所有文件', '*')]
+        try:
+            path = filedialog.askopenfilename(
+                parent=self, title='导入配置', filetypes=filetypes)
+        except tk.TclError:
+            # 个别 macOS/Tk 版本对 filetypes 仍会挑刺，退化为不带过滤再试一次
+            try:
+                path = filedialog.askopenfilename(parent=self, title='导入配置')
+            except tk.TclError as exc:
+                messagebox.showerror('导入失败', f'打不开文件选择窗口：{exc}')
+                return
         if not path:
             return
         try:
