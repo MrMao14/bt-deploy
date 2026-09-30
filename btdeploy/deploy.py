@@ -172,19 +172,41 @@ def merge_targets(existing: list, incoming: list) -> tuple[list, int, int]:
 def parse_targets_payload(payload):
     """从导入的 JSON 里抠出目标列表，返回 (目标列表, 元信息)。
 
-    认三种：目标导出文件（顶层 targets）、裸数组、本程序自己的配置文件
-    （v1 顶层 targets，v2 在 panels 里）。认不出来返回 (None, {})。"""
+    认目标导出文件（顶层 targets）、裸数组、v1 配置（顶层 targets）。
+    整份 v2 配置走 import_panels，不在这认。认不出来返回 (None, {})。"""
     if isinstance(payload, list):
         return payload, {}
     if isinstance(payload, dict):
         incoming = payload.get('targets')
-        if not isinstance(incoming, list):
-            panels = payload.get('panels')
-            incoming = ([t for p in panels if isinstance(p, dict)
-                         for t in (p.get('targets') or []) if isinstance(t, dict)]
-                        if isinstance(panels, list) else None)
         return (incoming or None), payload   # 空列表也算没东西可导
     return None, {}
+
+
+def import_panels(cfg: dict, payload: dict) -> tuple[int, int]:
+    """整份配置导入：按 payload['panels'] 重建面板，同名覆盖、其余新增。
+
+    连地址、密钥、目标列表一起带过来（配置是本机自己导出的，含密钥才有意义）。
+    没名字的面板跳过。返回 (新增数, 覆盖数)。"""
+    added = replaced = 0
+    for item in (payload.get('panels') or []):
+        if not isinstance(item, dict) or not str(item.get('name') or '').strip():
+            continue
+        name = str(item['name']).strip()
+        panel = next((p for p in cfg['panels'] if p.get('name') == name), None)
+        if panel is None:
+            panel = new_panel(name)
+            cfg['panels'].append(panel)
+            added += 1
+        else:
+            replaced += 1
+        if item.get('panel_url'):
+            panel['panel_url'] = str(item['panel_url']).strip()
+        if item.get('api_sk'):
+            panel['api_sk'] = str(item['api_sk'])
+        panel['verify_ssl'] = bool(item.get('verify_ssl'))
+        panel['targets'] = [dict(t) for t in (item.get('targets') or [])
+                            if isinstance(t, dict)]
+    return added, replaced
 
 
 

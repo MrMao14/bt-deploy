@@ -18,8 +18,8 @@ from pathlib import Path
 
 from btdeploy.api import BtApiError, BtClient
 from btdeploy.deploy import (CLOSE_LABELS, RESTART_LABELS, _migrate_config, build_zip,
-                             export_targets, merge_targets, new_panel, parse_targets_payload,
-                             restart_service, target_sources)
+                             export_targets, import_panels, merge_targets, new_panel,
+                             parse_targets_payload, restart_service, target_sources)
 from btdeploy import tray, update
 
 # Windows 控制台默认用 GBK，直接打印 emoji 会 UnicodeEncodeError
@@ -248,18 +248,32 @@ def check_config_io():
     merge_targets(original, [{'name': 'a', 'remote_dir': '/new'}])
     assert original[0]['remote_dir'] == '/old', 'merge 改动了入参'
 
-    # 导入还认本程序自己的配置文件：v1 顶层 targets，v2 收在 panels 里
-    incoming, meta = parse_targets_payload(
-        {'version': 2, 'panels': [{'targets': [{'name': 'p'}]}, {'name': 'q'}]})
-    assert [t['name'] for t in incoming] == ['p'], incoming
-    incoming, _meta = parse_targets_payload({'panel_url': 'x', 'targets': [{'name': 'v1'}]})
+    # parse 只认目标导出 / 裸数组 / v1 顶层 targets；整份 v2 配置走 import_panels
+    incoming, meta = parse_targets_payload({'panel_url': 'x', 'targets': [{'name': 'v1'}]})
     assert [t['name'] for t in incoming] == ['v1'], incoming
     incoming, _meta = parse_targets_payload([{'name': 'bare'}])
     assert [t['name'] for t in incoming] == ['bare'], incoming
     for junk in ({}, {'version': 2}, {'targets': []}, {'panels': []},
                  {'panels': 'junk'}, 'junk', 42, None):
         assert parse_targets_payload(junk)[0] is None, junk
-    print('✅ 导出不含密钥 / 导入按名称合并 / 认配置文件')
+
+    # 整份配置导入：同名面板覆盖（含密钥），其余新增，没名字的跳过
+    cfg = {'panels': [new_panel('本机')], 'active_panel': 0}
+    added, replaced = import_panels(cfg, {'panels': [
+        {'name': '本机', 'panel_url': 'https://new:8888', 'api_sk': 'k2',
+         'verify_ssl': False, 'targets': [{'name': 'x'}, 'garbage']},
+        {'name': '新面板', 'targets': [{'name': 'y'}]},
+        {'name': '   '}, 'junk', 42,
+    ]})
+    assert (added, replaced) == (1, 1), (added, replaced)
+    assert [p['name'] for p in cfg['panels']] == ['本机', '新面板'], cfg['panels']
+    assert cfg['panels'][0]['panel_url'] == 'https://new:8888'
+    assert cfg['panels'][0]['api_sk'] == 'k2'
+    assert cfg['panels'][0]['verify_ssl'] is False
+    assert cfg['panels'][0]['targets'] == [{'name': 'x'}], cfg['panels'][0]
+    assert [t['name'] for t in cfg['panels'][1]['targets']] == ['y']
+    assert import_panels(cfg, {'panels': []}) == (0, 0)
+    print('✅ 导出不含密钥 / 导入按名称合并 / 整份配置按面板导入')
 
 
 def check_close_action():

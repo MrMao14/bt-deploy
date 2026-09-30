@@ -17,7 +17,7 @@ from . import __version__, update
 from .api import BtApiError, BtClient
 from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, LIGHT_UNKNOWN, NEW_TARGET,
                      RESTART_CHOICES, RESTART_LABELS, collect_service_status, deploy,
-                     export_targets, load_config, merge_targets, new_panel,
+                     export_targets, import_panels, load_config, merge_targets, new_panel,
                      parse_targets_payload, save_config, target_sources)
 from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
@@ -1151,7 +1151,19 @@ class App(tk.Tk):
             messagebox.showerror('导入失败', f'读不了这个文件：{exc}')
             return
 
-        # 认目标导出文件、裸数组，也认本程序自己的 config.json（v1 顶层 / v2 在 panels 里）
+        # 整份 config.json（v2）：按配置重建面板，地址/密钥/目标一起带过来
+        if isinstance(payload, dict) and isinstance(payload.get('panels'), list):
+            added, replaced = import_panels(self.cfg, payload)
+            if not added + replaced:
+                messagebox.showerror('导入失败', '文件里没有可导入的面板')
+                return
+            save_config(self.cfg)
+            self._picked.clear()
+            self._load_active_panel()
+            self._log(f'✅ 已导入整份配置：新增 {added} 个面板，覆盖 {replaced} 个（含地址与密钥）')
+            return
+
+        # 其余（目标导出文件 / 裸数组 / v1 配置）：目标合并进当前面板
         incoming, meta = parse_targets_payload(payload)
         if not isinstance(incoming, list):
             messagebox.showerror('导入失败', '文件里没有 targets 数组')
@@ -1163,11 +1175,14 @@ class App(tk.Tk):
             self.var_url.set(str(meta['panel_url']))
         if 'verify_ssl' in meta:
             self.var_ssl.set(bool(meta['verify_ssl']))
+        if meta.get('api_sk'):      # v1 配置带密钥；目标导出文件按约定没有
+            self.var_key.set(str(meta['api_sk']))
 
         self._picked.clear()
         save_config(self.cfg)
         self._refresh_tree()
-        self._log(f'✅ 已导入：新增 {added} 个，覆盖 {replaced} 个。API 密钥需要自己填。')
+        key_note = '密钥已随文件带入' if meta.get('api_sk') else 'API 密钥需要自己填'
+        self._log(f'✅ 已导入：新增 {added} 个，覆盖 {replaced} 个。{key_note}。')
 
     # ------------------------------------------------------------- 任务执行
 
