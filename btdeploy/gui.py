@@ -57,8 +57,17 @@ def center_on(master, window):
     x = master.winfo_rootx() + (master.winfo_width() - width) // 2
     y = master.winfo_rooty() + (master.winfo_height() - height) // 2
     window.geometry(f'{width}x{height}+{x}+{y}')
-    window.wait_visibility()
+    wait_mapped(window)
     window.geometry(f'+{x}+{y}')   # map 之后再设一次，macOS 才认这个位置
+
+
+def wait_mapped(window):
+    """等窗口 map 出来再继续。Tk 8.6 的 tkwait visibility 只认 Map 事件：
+
+    对已经可见的窗口它会一直等到下一次 map（实际等于永远卡死），
+    所以先看一眼，已可见就直接放行。"""
+    if not window.winfo_viewable():
+        window.wait_visibility()
 
 
 class TargetDialog(tk.Toplevel):
@@ -137,7 +146,7 @@ class TargetDialog(tk.Toplevel):
         self.bind('<Escape>', lambda _e: self.destroy())
         self.resize_to_content(master)
         # 必须等窗口真正 map 出来再 grab，否则 Tcl 会报 "grab failed: window not viewable"
-        self.wait_visibility()
+        wait_mapped(self)
         self.grab_set()
         self.focus_set()
 
@@ -371,7 +380,7 @@ class CloseChoiceDialog(tk.Toplevel):
         self.protocol('WM_DELETE_WINDOW', self.destroy)   # 关掉 = 这次算了，什么都不改
         self.bind('<Escape>', lambda _e: self.destroy())
         center_on(master, self)
-        self.wait_visibility()
+        wait_mapped(self)
         self.grab_set()
         self.focus_set()
 
