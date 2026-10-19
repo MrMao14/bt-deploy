@@ -15,10 +15,11 @@ from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 from . import __version__, update
 from .api import BtApiError, BtClient
-from .deploy import (CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, LIGHT_UNKNOWN, NEW_TARGET,
-                     RESTART_CHOICES, RESTART_LABELS, collect_service_status, deploy,
-                     export_targets, import_panels, load_config, merge_targets, new_panel,
-                     parse_targets_payload, save_config, target_sources)
+from .deploy import (BAK_KEEP, CLOSE_ASK, CLOSE_CHOICES, CLOSE_LABELS, LIGHT_UNKNOWN,
+                     NEW_TARGET, RESTART_CHOICES, RESTART_LABELS, collect_service_status,
+                     deploy, export_targets, import_panels, list_backups, load_config,
+                     merge_targets, new_panel, parse_targets_payload, restore_backup,
+                     save_config, target_sources)
 from .tray import APP_TITLE, TrayIcon, acquire_single_instance, wake_existing
 PAD = 6
 
@@ -91,7 +92,6 @@ class TargetDialog(tk.Toplevel):
 
         self.var_name = tk.StringVar(value=self.data.get('name', ''))
         self.var_dst = tk.StringVar(value=self.data.get('remote_dir', ''))
-        self.var_tmp = tk.StringVar(value=self.data.get('temp_dir', '/tmp'))
 
         restart = self.data.get('restart') or {}
         self.var_kind = tk.StringVar(value=RESTART_LABELS.get(restart.get('type', 'none'), ''))
@@ -113,8 +113,6 @@ class TargetDialog(tk.Toplevel):
         # 可下拉可手输：面板上已配置的网站根目录会作为候选项
         self.combo_dst = ttk.Combobox(self.body, textvariable=self.var_dst, width=46)
         self._row(row, '远程目录', self.combo_dst)
-        row += 1
-        self._row(row, '临时目录', ttk.Entry(self.body, textvariable=self.var_tmp, width=46))
         row += 1
 
         kind_combo = ttk.Combobox(self.body, textvariable=self.var_kind, state='readonly',
@@ -345,7 +343,6 @@ class TargetDialog(tk.Toplevel):
             'source_dirs': sources,
             'keep_root': bool(self.var_keep_root.get()),
             'remote_dir': dst,
-            'temp_dir': self.var_tmp.get().strip() or '/tmp',
             'restart': restart,
         }
         self.destroy()
@@ -386,6 +383,44 @@ class CloseChoiceDialog(tk.Toplevel):
 
     def _pick(self, action: str):
         self.result = (action, bool(self.var_remember.get()))
+        self.destroy()
+
+
+class BackupPickerDialog(tk.Toplevel):
+    """从远程目录 bak/ 的备份里选一份还原。result = 备份文件名，取消为 None。"""
+
+    def __init__(self, master, backups: list[dict]):
+        super().__init__(master)
+        self.title('还原备份')
+        self.transient(master)
+        self.resizable(False, False)
+        self.result: str | None = None
+        self._names = [item['filename'] for item in backups]
+
+        body = ttk.Frame(self, padding=12)
+        body.grid(sticky='nsew')
+        ttk.Label(body, text=f'最多保留 {BAK_KEEP} 份，选一份覆盖回远程目录：').grid(
+            row=0, column=0, sticky='w')
+        self.listbox = tk.Listbox(body, width=56, height=len(backups), activestyle='dotbox')
+        self.listbox.grid(row=1, column=0, sticky='ew', pady=(PAD, 0))
+        for item in backups:
+            size = item['size'] / 1024 / 1024
+            when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(item['mtime']))
+            self.listbox.insert('end', f"{item['filename']}    {size:.1f} MB    {when}")
+        self.listbox.selection_set(0)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, sticky='e', pady=(PAD, 0))
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='left', padx=(0, PAD))
+        ttk.Button(buttons, text='还原', command=self._ok).pack(side='left')
+        self.listbox.bind('<Double-1>', lambda _e: self._ok())
+
+        center_on(master, self)
+
+    def _ok(self):
+        selection = self.listbox.curselection()
+        if selection:
+            self.result = self._names[selection[0]]
         self.destroy()
 
 class LogViewer(tk.Toplevel):
@@ -745,8 +780,6 @@ class App(tk.Tk):
             side='left', padx=(PAD * 3, 0))
         ttk.Button(actions, text='↓ 下移', command=lambda: self._move_target(1)).pack(
             side='left', padx=(PAD, 0))
-        ttk.Button(actions, text='导入配置', command=self._import_config).pack(
-            side='left', padx=(PAD * 3, 0))
         self.btn_deploy = ttk.Button(actions, text='开始部署', command=self._start_deploy)
         self.btn_deploy.pack(side='right')
 
@@ -775,6 +808,10 @@ class App(tk.Tk):
         self.combo_close.pack(side='right')
         self.combo_close.bind('<<ComboboxSelected>>', self._on_close_action_changed)
         ttk.Label(footer, text='关闭窗口时：').pack(side='right', padx=(0, PAD))
+        ttk.Button(footer, text='导出配置', command=self._export_config).pack(
+            side='right', padx=(0, PAD))
+        ttk.Button(footer, text='导入配置', command=self._import_config).pack(
+            side='right', padx=(0, PAD))
         self._sync_close_action()
 
     # ------------------------------------------------------------- 小工具
@@ -938,6 +975,7 @@ class App(tk.Tk):
                              command=lambda op=op: self._service_action(index, op))
         menu.add_separator()
         menu.add_command(label='查看日志', command=lambda: self._view_log(index))
+        menu.add_command(label='还原备份', command=lambda: self._restore_backup(index))
         menu.tk_popup(x, y)
         menu.grab_release()
 
@@ -1355,6 +1393,39 @@ class App(tk.Tk):
             self._log(f'全部完成，共 {total} 个部署目标')
 
         self._run_async(f'按顺序部署 {len(batch)} 个目标', work)
+
+    def _restore_backup(self, index):
+        targets = self._targets()
+        if not 0 <= index < len(targets):
+            return
+        target = targets[index]
+        if not (target.get('remote_dir') or '').strip():
+            messagebox.showinfo('提示', '这个目标没有配置远程目录')
+            return
+        try:
+            client = self._client()
+        except BtApiError as exc:
+            messagebox.showerror('配置错误', str(exc))
+            return
+
+        def loaded(backups):
+            if not backups:
+                messagebox.showinfo(
+                    '提示', f'该目标还没有备份：部署过一次才会有，存在远程目录的 bak/ 下，'
+                            f'最多保留 {BAK_KEEP} 份')
+                return
+            dialog = BackupPickerDialog(self, backups)
+            self.wait_window(dialog)
+            if not dialog.result:
+                return
+            remote = (target.get('remote_dir') or '').strip().rstrip('/')
+            if not messagebox.askyesno(
+                    '确认', f'用「{dialog.result}」覆盖 {remote}\n里的现有文件？'):
+                return
+            self._run_async(f'还原备份 {dialog.result}',
+                            lambda: restore_backup(client, target, dialog.result, log=self._log))
+
+        self._run_async('读取备份列表', lambda: list_backups(client, target['remote_dir']), loaded)
 
     # ------------------------------------------------------------- 退出
 

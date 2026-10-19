@@ -488,7 +488,7 @@ def check_gui_constructs():
             dialog = TargetDialog(app, {
                 'name': '检查',
                 'source_dirs': [str(Path(__file__).parent), tempfile.gettempdir()],
-                'remote_dir': '/tmp/check', 'temp_dir': '/tmp',
+                'remote_dir': '/tmp/check',
                 'restart': {'type': 'java_restart', 'project_name': 'demo'},
             }, data_loader=lambda: {
                 'dirs': ['/www/wwwroot/site-a', '/www/wwwroot/site-b'],
@@ -528,7 +528,7 @@ def check_gui_constructs():
             # 新行会把保存/取消顶到窗口外面，看得见点不到
             short = TargetDialog(app, {
                 'name': '尺寸检查', 'source_dirs': [str(Path(__file__).parent)],
-                'remote_dir': '/tmp/check', 'temp_dir': '/tmp',
+                'remote_dir': '/tmp/check',
                 'restart': {'type': 'none'},
             })
             short.update()

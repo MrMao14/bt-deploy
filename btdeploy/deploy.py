@@ -14,7 +14,6 @@ from .api import BtApiError, BtClient
 CONFIG_DIR = Path.home() / '.bt-deploy'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
 
-DEFAULT_TEMP_DIR = '/tmp'
 
 # (值, 界面显示文本)
 RESTART_CHOICES = [
@@ -47,7 +46,6 @@ NEW_TARGET = {
     'name': '新部署目标',
     'source_dirs': [],
     'remote_dir': '',
-    'temp_dir': DEFAULT_TEMP_DIR,
     'keep_root': True,
     'restart': {'type': 'none'},
 }
@@ -383,6 +381,52 @@ def collect_service_status(client: BtClient, targets: list) -> dict[int, tuple[s
     return statuses
 
 
+# ------------------------------------------------------------------ 备份 / 还原
+
+BAK_DIRNAME = 'bak'
+BAK_KEEP = 3
+BAK_PREFIX = 'btdeploy-'
+
+def bak_dir(remote_dir: str) -> str:
+    remote_dir = (remote_dir or '').strip().rstrip('/')
+    if not remote_dir:
+        raise BtApiError('远程目标目录不能为空')
+    return f'{remote_dir}/{BAK_DIRNAME}'
+
+
+def list_backups(client: BtClient, remote_dir: str) -> list[dict]:
+    """bak/ 里的部署包，按时间从新到旧。非本工具上传的文件一律不认。"""
+    files = client.list_dir(bak_dir(remote_dir))
+    ours = [item for item in files
+            if item['filename'].startswith(BAK_PREFIX) and item['filename'].endswith('.zip')]
+    return sorted(ours, key=lambda item: item['mtime'], reverse=True)
+
+
+def prune_backups(client: BtClient, remote_dir: str) -> int:
+    """超过 BAK_KEEP 份的旧备份删掉。返回删除的份数。"""
+    backups = list_backups(client, remote_dir)
+    for item in backups[BAK_KEEP:]:
+        client.delete(f"{bak_dir(remote_dir)}/{item['filename']}")
+    return max(0, len(backups) - BAK_KEEP)
+
+
+def restore_backup(client: BtClient, target: dict, filename: str, log=print) -> None:
+    """把 bak/ 里选中的部署包重新解压到远程目录，再走一遍部署后的重启动作。"""
+    remote_dir = (target.get('remote_dir') or '').strip().rstrip('/')
+    zip_path = f"{bak_dir(remote_dir)}/{filename}"
+
+    log(f'[1/2] 解压备份 {filename} 到 {remote_dir}')
+    result = client.unzip(zip_path, remote_dir)
+    failed = result.get('fail') if isinstance(result, dict) else None
+    if failed:
+        raise BtApiError(f'解压失败：{failed}')
+    log('      解压完成')
+
+    log('[2/2] 重启服务')
+    restart_service(client, target.get('restart') or {}, log)
+    log('还原完成 ✅')
+
+
 # ------------------------------------------------------------------ 部署流程
 
 def deploy(client: BtClient, target: dict, log=print) -> None:
@@ -396,7 +440,6 @@ def deploy(client: BtClient, target: dict, log=print) -> None:
     remote_dir = (target.get('remote_dir') or '').strip().rstrip('/')
     if not remote_dir:
         raise BtApiError('远程目标目录不能为空')
-    temp_dir = ((target.get('temp_dir') or '').strip() or DEFAULT_TEMP_DIR).rstrip('/')
 
     with tempfile.TemporaryDirectory(prefix='bt-deploy-') as work:
         log(f'[1/5] 打包 {len(sources)} 个路径')
@@ -406,28 +449,29 @@ def deploy(client: BtClient, target: dict, log=print) -> None:
         size_mb = zip_path.stat().st_size / 1024 / 1024
         log(f'      → {zip_path.name}（{size_mb:.2f} MB）')
 
-        log(f'[2/5] 上传到 {temp_dir}')
-        client.ensure_dir(temp_dir)
+        # 这次部署的包就存在远程目录的 bak/ 里当备份，还原时直接拿它重新解压
+        bak = f'{remote_dir}/bak'
+        log(f'[2/5] 上传到 {bak}')
+        client.ensure_dir(bak)
         # ponytail: 整个 zip 一次读进内存，几百 MB 以内没问题；再大就得改分片上传
         # 上传名固定用 ASCII：multipart 的 filename 带中文时部分面板版本会乱码
         upload_name = f'btdeploy-{time.strftime("%Y%m%d-%H%M%S")}.zip'
-        client.upload_file(temp_dir, upload_name, zip_path.read_bytes())
+        client.upload_file(bak, upload_name, zip_path.read_bytes())
         log('      上传成功')
 
         log(f'[3/5] 解压到 {remote_dir}')
-        remote_zip = f'{temp_dir}/{upload_name}'
-        result = client.unzip(remote_zip, remote_dir)
+        result = client.unzip(f'{bak}/{upload_name}', remote_dir)
         failed = result.get('fail') if isinstance(result, dict) else None
         if failed:
             raise BtApiError(f'解压失败：{failed}')
         log('      解压完成')
 
-        log('[4/5] 清理远程临时文件')
+        log('[4/5] 清理旧备份（最多保留 3 份）')
         try:
-            client.delete(remote_zip)
-            log('      已删除')
+            removed = prune_backups(client, remote_dir)
+            log(f'      清理了 {removed} 个旧备份' if removed else '      没有超出保留份数')
         except BtApiError as exc:
-            log(f'      删除失败（不影响结果，可手动清理）：{exc}')
+            log(f'      清理失败（不影响结果，可手动清理）：{exc}')
 
         log('[5/5] 重启服务')
         restart_service(client, target.get('restart') or {}, log)
