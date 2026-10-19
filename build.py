@@ -112,6 +112,19 @@ def main() -> int:
         args += ['--exclude-module', module]
     args.append('main.py')
 
+    # 旧版程序正在运行（比如缩在托盘）会锁住 dist 里的 exe，先结束它
+    if sys.platform == 'win32':
+        exe = ROOT / 'dist' / f'{NAME}.exe'
+        if exe.exists():
+            try:
+                exe.unlink()
+            except PermissionError:
+                print('检测到旧版 bt-deploy.exe 正在运行，先结束它…', flush=True)
+                subprocess.run(['taskkill', '/f', '/im', f'{NAME}.exe'],
+                               capture_output=True)
+                time.sleep(1)
+                exe.unlink()
+
     print('执行：', ' '.join(args), flush=True)
     subprocess.check_call(args, cwd=ROOT)
 
