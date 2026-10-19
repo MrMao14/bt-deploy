@@ -220,12 +220,34 @@ class BtClient:
                 files.append({'filename': name, 'size': size, 'mtime': mtime})
         return files
 
-    def read_file(self, path: str) -> str:
-        """GetFileBody：读整个文本文件。面板对大文件会拒绝，调用方先看列表里的 size。"""
-        data = self.post_form('/files', {'action': 'GetFileBody', 'path': path})
+    def read_file(self, path: str, mode: str | None = None, page: int = 1) -> tuple[str, bool]:
+        """GetFileBody：读文本文件，返回 (内容, 是否还有更早的段)。
+
+        大文件用 mode='reverse' 按段读：page=1 是文件末尾（最新），页码越大越早，
+        段内行序已经是最新在上，调用方不要再倒序。实测每段约 1000 行。
+        """
+        params = {'action': 'GetFileBody', 'path': path}
+        if mode:
+            params.update(mode=mode, p=page)
+        data = self.post_form('/files', params)
         if isinstance(data, dict):
-            return str(data.get('DATA') or data.get('data') or '')
-        return str(data)
+            text = str(data.get('DATA') or data.get('data') or '')
+            return text, bool(data.get('next'))
+        return str(data), False
+
+    def download_file(self, remote_path: str, local_path: str) -> None:
+        """/download：把文件整份流式下载到本地（GetFileBody 对大文件有限制）。"""
+        query = urllib.parse.urlencode({'filename': remote_path, **self.sign()})
+        req = urllib.request.Request(f'{self.base}/download?{query}')
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp, \
+                    open(local_path, 'wb') as fp:
+                while chunk := resp.read(1024 * 1024):
+                    fp.write(chunk)
+        except urllib.error.HTTPError as e:
+            raise BtApiError(f'HTTP {e.code}：{e.read()[:300].decode("utf-8", "replace")}') from None
+        except urllib.error.URLError as e:
+            raise BtApiError(f'无法连接面板（{self.base}）：{e.reason}') from None
 
     def config_info(self) -> dict:
         """GetConcifInfo：各组件的版本与运行状态，界面上的状态灯就是从这里来的。"""

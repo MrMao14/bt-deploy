@@ -428,9 +428,8 @@ class LogViewer(tk.Toplevel):
 
     QUICK_FILES = ('sys-info.log', 'sys-error.log')
     REFRESH_MS = 5000
-    # ponytail: GetFileBody 是整文件读，超过 16MB 就不拉了（会把面板拖垮），
-    # 真要看超大文件时再换成下载/分段方案
-    MAX_READ_SIZE = 16 * 1024 * 1024
+    # 整读上限；超过 10MB 就走 GetFileBody 的 mode=reverse 分段读，一次只拉一段
+    MAX_READ_SIZE = 10 * 1024 * 1024
 
     # 日志高亮：tag 名 → (正则, 颜色)，每行只标第一处命中
     STYLES = (
@@ -448,6 +447,8 @@ class LogViewer(tk.Toplevel):
         self.logs_dir = logs_dir
         self.current = ''           # 当前正在看的文件名
         self._sizes: dict[str, int] = {}
+        self._big = False           # 当前文件是否走 reverse 分段读
+        self._page = 1              # reverse 段号：1=文件末尾（最新），越大越早
         # 工作线程只写 _payload，取结果和画界面都在主线程 —— Tkinter 不是线程安全的
         self._payload = None
         self._loading = False
@@ -503,8 +504,18 @@ class LogViewer(tk.Toplevel):
         self.txt.grid(row=0, column=0, sticky='nsew')
         scroll.grid(row=0, column=1, sticky='ns')
 
-        self.status = ttk.Label(self, text='加载中…', anchor='w', padding=(PAD, 0))
-        self.status.pack(fill='x', side='bottom')
+        # 底部一行：翻页按钮（只有大文件才出现）+ 状态栏 + 下载
+        foot = ttk.Frame(self)
+        foot.pack(fill='x', side='bottom')
+        # 平时隐藏，只有大文件才在下载按钮左边出现（见 _apply）
+        self.btn_prev = ttk.Button(foot, text='<', width=3, state='disabled',
+                                   command=lambda: self._page_move(-1))
+        self.btn_next = ttk.Button(foot, text='>', width=3, state='disabled',
+                                   command=lambda: self._page_move(1))
+        ttk.Button(foot, text='下载到本地', command=self._download).pack(
+            side='right', padx=(0, PAD))
+        self.status = ttk.Label(foot, text='加载中…', anchor='w', padding=(PAD, 0))
+        self.status.pack(side='left', fill='x', expand=True)
 
         self.geometry('1100x680')
         self.refresh_files()
@@ -529,9 +540,8 @@ class LogViewer(tk.Toplevel):
         self.current = name
         self.combo_files.set(name)
         size = self._sizes.get(name)
-        if size is not None and size > self.MAX_READ_SIZE:
-            self._set_status(f'❌ {name} 有 {self._fmt_size(size)}，太大不拉取了，去面板网页上看', error=True)
-            return
+        self._big = size is not None and size > self.MAX_READ_SIZE
+        self._page = 1
         self._fetch(self._load_content, f'读取 {name} …')
 
     def _load_files(self):
@@ -542,8 +552,37 @@ class LogViewer(tk.Toplevel):
         return ('files', names, sizes)
 
     def _load_content(self):
-        return ('content', self.current,
-                self.client.read_file(f'{self.logs_dir.rstrip("/")}/{self.current}'))
+        path = f'{self.logs_dir.rstrip("/")}/{self.current}'
+        if self._big:
+            text, has_next = self.client.read_file(path, mode='reverse', page=self._page)
+        else:
+            text, has_next = self.client.read_file(path)
+        page = self._page if self._big else 0
+        return ('content', self.current, text, page, has_next and self._big)
+
+    def _page_move(self, step: int):
+        """大文件翻段：+1 下一段（更早，往文件开头），-1 上一段（更新，往文件末尾）。"""
+        if not (self._big and self.current):
+            return
+        target = self._page + step
+        if target < 1:
+            return
+        self._page = target
+        self._fetch(self._load_content, f'读取 {self.current} · 第 {target} 段…')
+
+    def _download(self):
+        """把当前日志整份下载到本地看（大文件翻页看不全时的兜底）。"""
+        if not self.current:
+            return
+        local = filedialog.asksaveasfilename(
+            parent=self, title='保存日志到本地', initialfile=self.current)
+        if not local:
+            return
+        self._fetch(lambda: self._do_download(local), f'下载 {self.current} …')
+
+    def _do_download(self, local: str):
+        self.client.download_file(f'{self.logs_dir.rstrip("/")}/{self.current}', local)
+        return ('downloaded', self.current, local)
 
     def _fetch(self, work, note: str):
         """后台跑 work()，结果塞进 _payload 由主线程 _poll 取走。已有请求在跑就跳过。"""
@@ -576,6 +615,9 @@ class LogViewer(tk.Toplevel):
         if kind == 'err':
             self._set_status(f'❌ {payload[1]}', error=True)
             return
+        if kind == 'downloaded':
+            self._set_status(f'✅ 已下载到 {payload[2]}')
+            return
         if kind == 'files':
             names, self._sizes = payload[1], payload[2]
             if list(self.combo_files['values']) != names:
@@ -592,17 +634,37 @@ class LogViewer(tk.Toplevel):
             if not self.current:
                 self.open_file(names[0])   # 默认看最新的一个
             return
-        name, content = payload[1], payload[2]
-        self._render(content)
+        name, content, page, has_next = payload[1], payload[2], payload[3], payload[4]
+        # reverse 分段返回的行序已经是最新在上，不能再倒一次；普通整读才需要倒序
+        self._render(content, newest_first=bool(page))
+        # 翻页按钮只对大文件出现，靠右排在下载按钮左边；先 pack 的在最右，< 才在 > 左边
+        for btn, padx in ((self.btn_next, (4, 0)), (self.btn_prev, (PAD, 0))):
+            if page and not btn.winfo_manager():
+                btn.pack(side='right', padx=padx)
+            elif not page and btn.winfo_manager():
+                btn.pack_forget()
+        self.btn_prev.configure(state='normal' if page > 1 else 'disabled')
+        self.btn_next.configure(state='normal' if has_next else 'disabled')
+        if page and not content.strip():
+            # 只有往更早的方向会翻空：退回上一段重新拉
+            self._page = max(1, page - 1)
+            self._fetch(self._load_content, f'读取 {self.current} · 第 {self._page} 段…')
+            return
         size = self._sizes.get(name)
-        info = f'{name} · {self._fmt_size(size)}' if size is not None else name
-        self._set_status(f'{info} · 刷新于 {time.strftime("%H:%M:%S")}')
+        refreshed = time.strftime('刷新于 %H:%M:%S')
+        if page:
+            self._set_status(f'{refreshed} · {name}（{self._fmt_size(size)}）'
+                             f'文件过大，已分段显示，请用下方按钮翻页 · 第 {page} 段')
+        else:
+            info = f'{name} · {self._fmt_size(size)}' if size is not None else name
+            self._set_status(f'{info} · {refreshed}')
 
-    def _render(self, content: str):
+    def _render(self, content: str, newest_first: bool = False):
         self.txt.configure(state='normal')
         self.txt.delete('1.0', 'end')
         lines = content.splitlines()
-        lines.reverse()   # 日志是往尾部追加的，倒过来最新在最上面
+        if not newest_first:
+            lines.reverse()   # 普通整读是旧→新，倒过来最新在最上面
         patterns = {tag: re.compile(pattern) for tag, pattern, _color in self.STYLES}
         for number, line in enumerate(lines, 1):
             self.txt.insert('end', line + '\n')
@@ -651,7 +713,11 @@ class LogViewer(tk.Toplevel):
         if not self.winfo_exists():
             return
         if self._auto.get() and self.current:
-            self.open_file(self.current)
+            if self._big:
+                # 大文件翻着段看的时候别把人拽回第一段，原地刷新
+                self._fetch(self._load_content, f'读取 {self.current} · 第 {self._page} 段…')
+            else:
+                self.open_file(self.current)
         self.after(self.REFRESH_MS, self._auto_loop)
 
     def _set_status(self, text: str, error: bool = False):
