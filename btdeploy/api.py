@@ -57,6 +57,34 @@ def _pick_java_path(row: dict) -> str:
     return posixpath.dirname(raw) if raw.endswith('.jar') else raw
 
 
+def _pick_java_running(row: dict) -> bool | None:
+    """从 Java 项目行判断进程是否运行。
+
+    project_list 里的 status 是站点记录字段，项目停止后也可能仍为 True；
+    实际运行状态要看 get_project_stat 写入的 pid / pid_info。
+    旧面板没有这两个字段时才退回 status。
+    """
+    for key in ('pid', 'pid_info'):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if key == 'pid_info':
+            return bool(value)
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ('', 'none', 'null', '0', 'false', 'stopped', 'stop',
+                        'notrunning', 'not running'):
+                return False
+            pids = [int(item) for item in re.findall(r'\d+', text)]
+            return any(pid > 0 for pid in pids) if pids else None
+        return bool(value)
+    return row.get('status')
 
 
 class BtClient:
@@ -266,10 +294,10 @@ class BtClient:
         return sites
 
     def list_java_projects(self) -> list[dict]:
-        """面板上的 Java 项目：每项 {'name': 项目名, 'path': 项目目录}。
+        """面板上的 Java 项目：每项含名称、目录和实际运行状态。
 
         path 可能为空 —— project_list 的字段各面板版本不一样，能解析到就用，
-        解析不到就留空让用户手填。
+        解析不到就留空让用户手填。status 不能直接取站点记录字段，要按 pid 判断。
         """
         endpoint = '/mod/java/project/project_list/stype'
         try:
@@ -283,7 +311,10 @@ class BtClient:
             if isinstance(row, dict):
                 name = row.get('name') or row.get('project_name')
                 if name:
-                    found[str(name)] = {'path': _pick_java_path(row), 'status': row.get('status')}
+                    found[str(name)] = {
+                        'path': _pick_java_path(row),
+                        'status': _pick_java_running(row),
+                    }
             elif isinstance(row, str):
                 # 有的面板版本按 "name;size;..." 这种分号串返回，状态没法从字符串里认
                 found.setdefault(row.split(';')[0], {'path': '', 'status': None})

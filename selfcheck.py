@@ -353,12 +353,16 @@ def check_site_and_java_parsing():
     ], client.list_sites()
 
     client.get = lambda path, params=None: {
-        'data': [{'name': 'demo', 'project_jar': '/opt/demo/app.jar', 'status': True},
-                 {'name': 'plain'}],
+        'data': [{'name': 'demo', 'project_jar': '/opt/demo/app.jar',
+                  'status': False, 'pid': '123, 124'},
+                 {'name': 'plain'},
+                 {'name': 'stopped', 'project_jar': '/opt/stopped/app.jar',
+                  'status': True, 'pid': None}],
     }
     assert client.list_java_projects() == [
         {'name': 'demo', 'path': '/opt/demo', 'status': True},
         {'name': 'plain', 'path': '', 'status': None},
+        {'name': 'stopped', 'path': '/opt/stopped', 'status': False},
     ], client.list_java_projects()
     print('✅ 网站 / Java 项目列表字段解析')
 
